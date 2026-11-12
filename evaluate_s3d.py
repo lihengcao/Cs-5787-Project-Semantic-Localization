@@ -2,20 +2,28 @@
 
     python evaluate_s3d.py --s3d_root <Structured3D>
 """
+from __future__ import annotations
+
 import argparse
 import json
 import os
+from typing import Any
 
 import numpy as np
 from tqdm import tqdm
 
 from scenealigner import structured3d as s3d
 from scenealigner.evaluation import compute_pose_error_analytic, get_camera_center_on_density_px
-from scenealigner.inference import S3D_MODEL_REPO, align_to_floorplan, load_model, reconstruct_projection_geometry
-from scenealigner.preprocess import load_models, reconstruct
+from scenealigner.inference import S3D_MODEL_REPO, PoseAlignment, align_to_floorplan, load_model, reconstruct_projection_geometry
+from scenealigner.preprocess import ReconstructionDict, load_models, reconstruct
 
 
-def pose_errors(recon, alignment, plan_params, view_dir):
+def pose_errors(
+    recon: ReconstructionDict,
+    alignment: PoseAlignment,
+    plan_params: s3d.PlanParams,
+    view_dir: str,
+) -> tuple[float, float]:
     """Positional (m) and angular (degrees) errors of the camera of a view aligned to its floorplan."""
     eye, forward = s3d.load_camera(view_dir)[:2]
     center_px = get_camera_center_on_density_px(recon["extrinsics"], alignment["proj_params"])[0]
@@ -24,15 +32,15 @@ def pose_errors(recon, alignment, plan_params, view_dir):
     return float(t_err * s3d.MM_PER_PIXEL / plan_params[1] / 1000), r_err
 
 
-def compute_metrics(t_errs, r_errs):
+def compute_metrics(t_errs: list[float], r_errs: list[float]) -> dict[str, float]:
     """Table 3: recalls (%) over the views."""
-    t_errs, r_errs = np.array(t_errs), np.array(r_errs)
-    metrics = {f"Pos@{thr}m": np.mean(t_errs < thr) for thr in (0.1, 0.5, 1.0)}
-    metrics["Ang&Pos@(30,1m)"] = np.mean((t_errs < 1.0) & (r_errs < 30.0))
+    t_errs_arr, r_errs_arr = np.array(t_errs), np.array(r_errs)
+    metrics = {f"Pos@{thr}m": np.mean(t_errs_arr < thr) for thr in (0.1, 0.5, 1.0)}
+    metrics["Ang&Pos@(30,1m)"] = np.mean((t_errs_arr < 1.0) & (r_errs_arr < 30.0))
     return {k: float(v) * 100 for k, v in metrics.items()}
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--s3d_root", required=True, help="Structured3D dataset: the directory of the scene_* folders")
     parser.add_argument("--checkpoint_dir", default=S3D_MODEL_REPO, help="LoRA layers")
@@ -54,7 +62,7 @@ def main():
                 alignment = align_to_floorplan(recon, plan_img, model)
             except ValueError:  # no similarity transform: the identity is used
                 proj_params = reconstruct_projection_geometry(recon["points_cam0"], recon["conf"], recon["est_gravity_cam"])[0]
-                alignment = {"proj_params": proj_params, "M": np.eye(2, 3)}
+                alignment: PoseAlignment = {"proj_params": proj_params, "M": np.eye(2, 3)}
                 failed += 1
             t_err, r_err = pose_errors(recon, alignment, plan_params, view_dir)
             t_errs.append(t_err)

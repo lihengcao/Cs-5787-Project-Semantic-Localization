@@ -2,13 +2,18 @@
 
     python -m scenealigner.structured3d <scene directory> <image>   # draws the floorplan of a scene
 """
+from __future__ import annotations
+
 import io
 import json
 import os
+from collections.abc import Sequence
+from typing import Any, TypeAlias
 
 import cv2
 import matplotlib
 import numpy as np
+from numpy.typing import NDArray
 from PIL import Image, ImageOps
 from shapely.geometry import GeometryCollection, MultiPolygon, Polygon
 from shapely.ops import unary_union
@@ -18,18 +23,20 @@ from .preprocess import resize_plan
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
+PlanParams: TypeAlias = tuple[tuple[float, float], float, tuple[int, int]]
+
 MM_PER_PIXEL = 10.0  # of the drawn floorplan, before it is resized
 CANVAS = 80000  # mm: the drawing covers 40 m around the origin of a scene
 TRAIN_SCENES, TEST_SCENES = range(0, 3000), range(3250, 3500)
 OFF_CANVAS_SCENES = (2119, 2208, 2401)  # train scenes whose floorplans lie (partly) outside the drawing
 
 
-def convert_lines_to_vertices(lines):
+def convert_lines_to_vertices(lines: Sequence[Sequence[int]] | NDArray[np.integer[Any]]) -> list[list[int]]:
     """Chains line segments (pairs of junctions) into polygons, as the Structured3D toolbox does. Polygons of
     fewer than three junctions are dropped."""
     polygons, polygon = [], None
 
-    def close(polygon):
+    def close(polygon: list[int]) -> None:
         polygon = [v for i, v in enumerate(polygon) if i == 0 or v != polygon[i - 1]]
         if len(set(polygon)) >= 3:
             polygons.append(polygon)
@@ -57,13 +64,13 @@ def convert_lines_to_vertices(lines):
     return polygons
 
 
-def load_polygons(annos):
+def load_polygons(annos: dict[str, Any]) -> list[tuple[list[int], str]]:
     """Outlines of the rooms, doors and windows (their floor planes) and of the outer wall, as junction indices."""
-    def junction_pairs(line_ids):
+    def junction_pairs(line_ids: Sequence[int] | NDArray[np.integer[Any]]) -> list[list[int]]:
         pairs = [np.where(np.array(annos["lineJunctionMatrix"][line_id]))[0].tolist() for line_id in line_ids]
         return [pair for pair in pairs if len(pair) == 2]
 
-    def lines_of(plane_id):
+    def lines_of(plane_id: int) -> list[int]:
         return np.where(np.array(annos["planeLineMatrix"][plane_id]))[0].tolist()
 
     polygons = []
@@ -90,11 +97,12 @@ def load_polygons(annos):
     return polygons
 
 
-def render_floorplan(annos, dpi=100):
+def render_floorplan(annos: dict[str, Any], dpi: int = 100) -> tuple[Image.Image, tuple[float, float]]:
     """Draws the floorplan of a scene at 1 cm per pixel, cropped to its content: walls black, rooms white. Doors
     and windows are not drawn. Returns the image and the position of its top-left corner, in pixels from the
     origin of the scene."""
     junctions = np.array([junction["coordinate"][:2] for junction in annos["junctions"]])
+    rooms: Any
     rooms, outer_wall = [], None
     for indices, polygon_type in load_polygons(annos):
         polygon = Polygon(junctions[np.array(indices, dtype=int)])
@@ -110,7 +118,7 @@ def render_floorplan(annos, dpi=100):
     if isinstance(rooms, GeometryCollection):
         rooms = unary_union([g for g in rooms.geoms if isinstance(g, (Polygon, MultiPolygon))])
 
-    def parts(shape):
+    def parts(shape: Any) -> list[Polygon]:
         if shape is None or shape.is_empty:
             return []
         return [g for g in getattr(shape, "geoms", [shape]) if isinstance(g, Polygon) and not g.is_empty]
@@ -134,11 +142,11 @@ def render_floorplan(annos, dpi=100):
     plt.savefig(buffer, dpi=dpi, bbox_inches="tight", pad_inches=0, facecolor="white")
     plt.close()
     img = Image.open(buffer).convert("RGB")
-    box = ImageOps.invert(img.convert("L")).getbbox()
+    box: Any = ImageOps.invert(img.convert("L")).getbbox()
     return img.crop(box), (box[0] - img.width / 2, box[1] - img.height / 2)
 
 
-def load_floorplan(scene_dir, plan_size=512):
+def load_floorplan(scene_dir: str, plan_size: int = 512) -> tuple[Image.Image, PlanParams]:
     """Floorplan of a scene, resized as the floorplans of C3, and the parameters of world_to_plan."""
     with open(os.path.join(scene_dir, "annotation_3d.json")) as f:
         annos = json.load(f)
@@ -147,14 +155,14 @@ def load_floorplan(scene_dir, plan_size=512):
     return plan_img, (origin, scale, (off_x, off_y))
 
 
-def world_to_plan(points, plan_params):
+def world_to_plan(points: NDArray[np.floating[Any]], plan_params: PlanParams) -> NDArray[np.floating[Any]]:
     """World coordinates (..., 2 or 3) in mm -> floorplan pixels (..., 2). The rows of the floorplan run along -y."""
     (delta_x, delta_y), scale, (off_x, off_y) = plan_params
     return np.stack([(points[..., 0] / MM_PER_PIXEL - delta_x) * scale + off_x,
                      (-points[..., 1] / MM_PER_PIXEL - delta_y) * scale + off_y], axis=-1)
 
 
-def list_views(scene_dir):
+def list_views(scene_dir: str) -> list[str]:
     """Directories of the furnished perspective views of a scene, in order."""
     rendering_dir = os.path.join(scene_dir, "2D_rendering")
     views = []
@@ -165,18 +173,20 @@ def list_views(scene_dir):
     return [view for view in views if all(os.path.exists(os.path.join(view, name)) for name in ("camera_pose.txt", "depth.png", "rgb_rawlight.png"))]
 
 
-def load_camera(view_dir):
+def load_camera(
+    view_dir: str,
+) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64], np.float64, np.float64]:
     """Camera of a view: position (mm), viewing direction, up direction and half fields of view (rad)."""
     with open(os.path.join(view_dir, "camera_pose.txt")) as f:
         values = np.array(f.read().split(), dtype=np.float64)
     return values[0:3], values[3:6], values[6:9], values[9], values[10]
 
 
-def load_world_points(view_dir, size=518):
+def load_world_points(view_dir: str, size: int = 518) -> NDArray[np.float64]:
     """3D point (mm, world frame) of every pixel of a view as loaded by pi3 (resized and padded to 518 x 518),
     from its depth map and camera. NaN where there is no depth."""
     eye, view, up, xfov, yfov = load_camera(view_dir)
-    depth = cv2.imread(os.path.join(view_dir, "depth.png"), cv2.IMREAD_UNCHANGED).astype(np.float64)
+    depth = cv2.imread(os.path.join(view_dir, "depth.png"), cv2.IMREAD_UNCHANGED).astype(np.float64)  # type: ignore[union-attr]
     height, width = depth.shape
     new_height = int(round(height * (size / width) / 14) * 14)
     pad_top = (size - new_height) // 2

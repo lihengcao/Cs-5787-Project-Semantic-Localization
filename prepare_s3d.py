@@ -4,11 +4,15 @@ Every view gives two samples: one from its pi3 reconstruction, one from its grou
 
     python prepare_s3d.py --s3d_root <Structured3D> --output <data>
 """
+from __future__ import annotations
+
 import argparse
 import os
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pandas as pd
+from numpy.typing import NDArray
 from PIL import Image
 from tqdm import tqdm
 
@@ -18,10 +22,20 @@ from scenealigner.inference import reconstruct_projection_geometry
 from scenealigner.preprocess import load_models, reconstruct
 from scenealigner.training import render_training_map
 
+if TYPE_CHECKING:
+    from scenealigner.evaluation import CorrespondencesDict
+    from scenealigner.preprocess import ReconstructionDict
+
 MIN_CORRESPONDENCES = 10
 
 
-def depth_sample(world_points, plan_xy, plan_gray, size=512, padding=0.1):
+def depth_sample(
+    world_points: NDArray[np.float64],
+    plan_xy: NDArray[np.floating[Any]],
+    plan_gray: NDArray[np.uint8],
+    size: int = 512,
+    padding: float = 0.1,
+) -> tuple[Image.Image, NDArray[np.float32], NDArray[np.float32]]:
     """Density map of the ground-truth points of a view, seen from above in the world frame (z up), and its
     correspondences: the pixels of the points that lie on walls (dark pixels) of the floorplan."""
     valid = ~np.isnan(world_points).any(axis=-1)
@@ -49,7 +63,9 @@ def depth_sample(world_points, plan_xy, plan_gray, size=512, padding=0.1):
     return density_img, density_px[on_wall], plan_px[on_wall]
 
 
-def pi3_sample(recon, plan_xy, plan_gray):
+def pi3_sample(
+    recon: ReconstructionDict, plan_xy: NDArray[np.floating[Any]], plan_gray: NDArray[np.uint8]
+) -> tuple[Image.Image, NDArray[np.float32], NDArray[np.float32]]:
     """Density map of the pi3 reconstruction of a view and its correspondences: the pixels of the reconstructed
     points whose ground-truth positions (plan_xy) lie on walls of the floorplan."""
     inside = ~np.isnan(plan_xy).any(axis=-1) & ((plan_xy >= 0) & (plan_xy < plan_gray.shape[0])).all(axis=-1)
@@ -57,14 +73,14 @@ def pi3_sample(recon, plan_xy, plan_gray):
     on_wall = inside.copy()
     on_wall[inside] = plan_gray[plan_idx[:, 1], plan_idx[:, 0]] < 50
     v, u = np.nonzero(on_wall)
-    corr_data = {"tensor_coords": np.stack([u, v], axis=1).astype(np.float32), "plan_coords": plan_xy[on_wall].astype(np.float32)}
+    corr_data: CorrespondencesDict = {"tensor_coords": np.stack([u, v], axis=1).astype(np.float32), "plan_coords": plan_xy[on_wall].astype(np.float32)}
 
     proj_params, points, mask = reconstruct_projection_geometry(recon["points_cam0"], recon["conf"], recon["est_gravity_cam"])
     density_px, plan_px = process_gt_correspondences(corr_data, 0, recon["points_cam0"], proj_params, mask)
     return render_training_map(points, proj_params), density_px, plan_px
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--s3d_root", required=True, help="Structured3D dataset: the directory of the scene_* folders")
     parser.add_argument("--output", required=True)

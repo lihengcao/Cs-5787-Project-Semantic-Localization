@@ -4,14 +4,19 @@
     python -m scenealigner.viewer outputs/S221 --render first_frame.png  # image of the first-frame view
     python -m scenealigner.viewer outputs/S221 --render view.png --angle 90  # ... after a quarter turn of the turntable
 """
+from __future__ import annotations
+
 import argparse
 import glob
 import os
 import time
+from collections.abc import Mapping
+from typing import Any
 
 import numpy as np
 import viser
 import viser.transforms as vtf
+from numpy.typing import NDArray
 from PIL import Image
 
 # First-frame view in the floorplan frame (floorplan on the unit square at z = 0, Z up)
@@ -19,12 +24,12 @@ POSITION, LOOK_AT, FOV = (-1.3571, -2.2206, 2.4501), (0.0, 0.0, 0.0), np.deg2rad
 COLORS = [(123, 88, 244), (228, 119, 177), (203, 39, 39), (88, 231, 244)]  # cameras of each photo collection
 
 
-def rotation_z(angle):
+def rotation_z(angle: float | np.floating[Any]) -> NDArray[np.float64]:
     c, s = np.cos(angle), np.sin(angle)
     return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
 
 
-def show(scenes, plan_img, port=8080):
+def show(scenes: Mapping[str, Mapping[str, Any]], plan_img: NDArray[np.uint8], port: int = 8080) -> Any:
     """Starts a viewer of the scenes {name: scene} on the floorplan. Returns the viser server."""
     server = viser.ViserServer(port=port)
     server.scene.set_up_direction("+z")
@@ -50,17 +55,17 @@ def show(scenes, plan_img, port=8080):
     turntable = server.gui.add_button("Turntable")
 
     @point_size.on_update
-    def _(_):
+    def _(_: Any) -> None:
         for cloud in clouds:
             cloud.point_size = point_size.value
 
     @show_cameras.on_update
-    def _(_):
+    def _(_: Any) -> None:
         for frustum in frustums:
             frustum.visible = show_cameras.value
 
     @turntable.on_click
-    def _(event):
+    def _(event: Any) -> None:
         camera = event.client.camera
         position, look_at = np.array(camera.position), np.array(camera.look_at)
         for angle in np.linspace(0, 2 * np.pi, 80):  # 4 seconds at 20 frames per second
@@ -71,7 +76,7 @@ def show(scenes, plan_img, port=8080):
     return server
 
 
-def render(server, path, angle=0.0, width=1280, height=720):
+def render(server: Any, path: str, angle: float = 0.0, width: int = 1280, height: int = 720) -> None:
     """Saves an image of the first-frame view, turned by angle (degrees) as by the turntable. It is rendered by a
     headless browser (Playwright) if installed, or else by the first browser that opens the viewer."""
     url = f"http://localhost:{server.get_port()}"
@@ -103,7 +108,7 @@ def render(server, path, angle=0.0, width=1280, height=720):
         playwright.stop()
 
 
-def load(directory):
+def load(directory: str) -> tuple[dict[str, dict[str, Any]], NDArray[np.uint8]]:
     """Scenes {name: scene} and the floorplan saved by demo.py."""
     scenes = {os.path.basename(p)[:-4]: dict(np.load(p)) for p in sorted(glob.glob(os.path.join(directory, "*.npz")))}
     return scenes, np.array(Image.open(os.path.join(directory, "floorplan.png")).convert("RGB"))

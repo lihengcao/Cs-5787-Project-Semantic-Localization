@@ -3,10 +3,13 @@
     python demo.py --images examples/S221/interior examples/S221/exterior --floorplan examples/S221/floorplan.jpg
     python demo.py --images <view>/rgb_rawlight.png --floorplan <floorplan> --structured3d   # a view of Structured3D
 """
+from __future__ import annotations
+
 import argparse
 import glob
 import os
 import random
+from typing import TYPE_CHECKING
 
 import numpy as np
 from PIL import Image
@@ -16,8 +19,11 @@ from scenealigner.inference import MODEL_REPO, S3D_MODEL_REPO, align_to_floorpla
 from scenealigner.preprocess import load_and_resize_plan, load_models, reconstruct, split_into_chunks
 from scenealigner.visualization import draw_alignment, draw_scene_cameras, draw_solid_points
 
+if TYPE_CHECKING:
+    from scenealigner.inference import AlignedSceneDict
 
-def main():
+
+def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--images", nargs="+", required=True, help="one directory, or one image, per photo collection")
     parser.add_argument("--floorplan", required=True)
@@ -39,6 +45,7 @@ def main():
     plan_img.save(os.path.join(args.output, "floorplan.png"))
     plan = np.array(plan_img)
 
+    scenes: dict[str, AlignedSceneDict]
     scenes, cameras_img = {}, plan.copy()
     for directory, color in zip(args.images, viewer.COLORS * len(args.images)):
         # Each collection is reconstructed and aligned independently (in chunks of at most 150 photos)

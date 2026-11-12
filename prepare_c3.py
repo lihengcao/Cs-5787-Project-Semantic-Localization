@@ -4,26 +4,31 @@
     python prepare_c3.py --c3_root <C3> --train_csv <cache>/train.csv --output <data> --model vggt    # VGGT, photo collections
     python prepare_c3.py --c3_root <C3> --train_csv <cache>/train.csv --output <data> --single_view   # pi3, single photos
 """
+from __future__ import annotations
+
 import argparse
 import os
 import random
+from collections.abc import Sequence
+from typing import Any
 
 import cv2
 import numpy as np
 import pandas as pd
 import torch
+from numpy.typing import NDArray
 from tqdm import tqdm
 
-from scenealigner.evaluation import load_correspondences, process_gt_correspondences
+from scenealigner.evaluation import CorrespondencesDict, load_correspondences, process_gt_correspondences
 from scenealigner.inference import reconstruct_projection_geometry
-from scenealigner.preprocess import GEOCALIB_SEED, estimate_gravity, load_and_resize_plan, load_models, reconstruct
+from scenealigner.preprocess import GEOCALIB_SEED, ReconstructionDict, estimate_gravity, load_and_resize_plan, load_models, reconstruct
 from scenealigner.training import render_training_map
 
 GAMMAS = (0.25, 0.5, 0.75, 1.0)
 XZ_SLICES = (0.0, 2.5, 5.0)  # x/z percentile filters
 
 
-def cached_gravity(path, photo_path, geocalib):
+def cached_gravity(path: str, photo_path: str, geocalib: Any) -> NDArray[np.floating[Any]]:
     """Gravity direction of a photo, estimated once for all runs."""
     if not os.path.exists(path):
         torch.manual_seed(GEOCALIB_SEED)
@@ -33,24 +38,32 @@ def cached_gravity(path, photo_path, geocalib):
     return np.load(path)
 
 
-def find_correspondences(c3_root, uid):
+def find_correspondences(c3_root: str, uid: int) -> str | None:
     """C3 keeps the annotations of our train split in its train and val folders."""
     for split in ("train", "val"):
         path = os.path.join(c3_root, "geometric", split, "correspondences", str(uid // 1000), f"{uid:06d}.npy")
         if os.path.exists(path):
             return path
+    return None
 
 
-def is_consistent(density_px, plan_px, single_view):
+def is_consistent(density_px: NDArray[np.float32], plan_px: NDArray[np.float32], single_view: bool) -> bool:
     """The correspondences have to agree with a similarity transform (RANSAC). Those of a single photo also need
     40 inliers, 30% of inliers and a scale within [0.2, 3]."""
     M, inliers = cv2.estimateAffinePartial2D(density_px, plan_px, method=cv2.RANSAC, ransacReprojThreshold=10.0)
     if M is None or not single_view:
         return M is not None
-    return 0.2 <= np.sqrt(M[0, 0] ** 2 + M[0, 1] ** 2) <= 3.0 and inliers.sum() >= 40 and inliers.mean() >= 0.3
+    return 0.2 <= np.sqrt(M[0, 0] ** 2 + M[0, 1] ** 2) <= 3.0 and bool(inliers.sum() >= 40 and inliers.mean() >= 0.3)
 
 
-def generate(recon, batch_corrs, conf_threshold, single_view, output, name):
+def generate(
+    recon: ReconstructionDict,
+    batch_corrs: Sequence[CorrespondencesDict | None],
+    conf_threshold: int,
+    single_view: bool,
+    output: str,
+    name: str,
+) -> list[dict[str, str]]:
     """Saves the density maps of a reconstruction with their correspondences. Returns their paths."""
     saved = []
     for xz_slice_val in ((2.5,) if single_view else XZ_SLICES):
@@ -74,7 +87,7 @@ def generate(recon, batch_corrs, conf_threshold, single_view, output, name):
     return saved
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--c3_root", required=True, help="C3 dataset, with visual/ and geometric/")
     parser.add_argument("--train_csv", required=True, help="train.csv of our dataset repository")
@@ -118,7 +131,7 @@ def main():
                     recon = reconstruct(photo_paths, recon_model, geocalib, mode, gravities)
                     batch_corrs = [load_correspondences(find_correspondences(args.c3_root, uid), photo_path, plan_transform_params, mode)
                                    for uid, photo_path in zip(photos.uid, photo_paths)]
-                    name = os.path.join(run, scene_id + (f"_{photos.uid.iloc[0]:06d}" if args.single_view else ""))
+                    name = os.path.join(run, scene_id + (f"_{photos.uid.iloc[0]:06d}" if args.single_view else ""))  # type: ignore[operator]
                     for saved in generate(recon, batch_corrs, conf_threshold, args.single_view, args.output, name):
                         pairs.append({"scene_id": scene_id, "floorplan": plan_path, **saved})
             columns = ["scene_id", "density", "floorplan", "correspondences"]

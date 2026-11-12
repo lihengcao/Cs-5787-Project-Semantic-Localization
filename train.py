@@ -3,11 +3,14 @@
     python train.py --data <data> --output <run>                                                   # C3
     python train.py --data <data> --output <run> --epochs 20 --resolutions 512 --min_points 1000   # Structured3D
 """
+from __future__ import annotations
+
 import argparse
 import csv
 import os
 import random
 from functools import partial
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -20,10 +23,13 @@ from scenealigner.inference import SOFT_ARGMAX_TEMPERATURE, load_model, sample_d
 from scenealigner.training import (DensityFloorplanDataset, collate, feature_matching_loss, geometry_loss,
                                    regression_loss, topology_loss)
 
+if TYPE_CHECKING:
+    from scenealigner.training import TrainingBatchDict
+
 LAMBDA_REGR, LAMBDA_TOPO, LAMBDA_GEO = 50.0, 10.0, 10.0  # the weight of the feature matching loss is 1
 
 
-def ramp(step, start, duration):
+def ramp(step: int, start: int, duration: int) -> float:
     """Weight of a loss that is introduced linearly from `start` over `duration` iterations."""
     if step < start:
         return 0.0
@@ -32,7 +38,9 @@ def ramp(step, start, duration):
     return (step - start) / duration
 
 
-def compute_loss(model, batch, step, total_steps):
+def compute_loss(
+    model: Any, batch: TrainingBatchDict, step: int, total_steps: int
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Loss of a batch at a training step, and its terms."""
     density_img, plan_img = batch["density_img"].cuda(), batch["plan_img"].cuda()
     pts_density, pts_plan, valid = batch["density_pts"].cuda(), batch["plan_pts"].cuda(), batch["valid"].cuda()
@@ -72,7 +80,7 @@ def compute_loss(model, batch, step, total_steps):
     return loss, losses
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", required=True, help="training data (prepare_c3.py or prepare_s3d.py)")
     parser.add_argument("--output", required=True, help="directory of the LoRA layers and the training log")

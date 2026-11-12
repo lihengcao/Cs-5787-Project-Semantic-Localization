@@ -1,6 +1,9 @@
 """Floorplan alignment: density map (Sec. 3.2), cross-modal correspondences and 2D similarity transform M
 (Sec. 3.3), and the floorplan-aligned 3D scene."""
+from __future__ import annotations
+
 import os
+from typing import TYPE_CHECKING, Any, NotRequired, TypedDict
 
 import cv2
 import numpy as np
@@ -8,10 +11,44 @@ import torch
 import torch.nn.functional as F
 from dinov3.hub.backbones import dinov3_vitb16
 from huggingface_hub import hf_hub_download, snapshot_download
+from numpy.typing import NDArray
 from peft import PeftModel
 from PIL import Image
 from safetensors.torch import load_file
 from torchvision import transforms as T
+
+if TYPE_CHECKING:
+    from .preprocess import ReconstructionDict
+
+
+class ProjParams(TypedDict):
+    R_rect: NDArray[np.floating[Any]]
+    min_x: float
+    min_z: float
+    scale: float
+    cx: float
+    cz: float
+    density_size: int
+
+
+class PoseAlignment(TypedDict):
+    proj_params: ProjParams
+    M: NDArray[Any]
+
+
+class AlignmentDict(PoseAlignment):
+    density_img: Image.Image
+    src_px: NDArray[np.float32]
+    dst_px: NDArray[np.float32]
+
+
+class AlignedSceneDict(TypedDict):
+    points: NDArray[np.float32]
+    colors: NDArray[np.uint8]
+    cam_to_world: NDArray[np.float32]
+    thumbnails: NotRequired[NDArray[np.uint8]]
+    image_sizes: NotRequired[NDArray[np.integer[Any]]]
+    color: NotRequired[NDArray[np.integer[Any]]]
 
 MODEL_REPO = "jhcho99/SceneAligner"  # our LoRA layers
 S3D_MODEL_REPO = "jhcho99/SceneAligner/structured3d"  # our LoRA layers for Structured3D
@@ -24,7 +61,7 @@ SOFT_ARGMAX_TEMPERATURE = 0.02
 norm_transform = T.Compose([T.ToTensor(), T.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))])
 
 
-def load_timm_weights(base_model):
+def load_timm_weights(base_model: Any) -> dict[str, torch.Tensor]:
     """timm's DINOv3 weights with the parameter names of the DINOv3 code."""
     state_dict = load_file(hf_hub_download(DINOV3_TIMM_REPO, "model.safetensors", revision=DINOV3_TIMM_REVISION))
     state_dict = {k.replace("reg_token", "storage_tokens").replace("gamma_1", "ls1.gamma").replace("gamma_2", "ls2.gamma"): v
@@ -37,7 +74,7 @@ def load_timm_weights(base_model):
     return state_dict
 
 
-def load_model(checkpoint_dir=MODEL_REPO, dinov3_weights=None):
+def load_model(checkpoint_dir: str = MODEL_REPO, dinov3_weights: str | None = None) -> Any:
     """DINOv3 ViT-B/16 with our LoRA layers, or the pretrained DINOv3 if checkpoint_dir is "pre-trained".
 
     checkpoint_dir: local directory, or model repository on the Hugging Face Hub, optionally with a subfolder.
@@ -55,8 +92,16 @@ def load_model(checkpoint_dir=MODEL_REPO, dinov3_weights=None):
     return PeftModel.from_pretrained(base_model, checkpoint_dir).eval().to("cuda")
 
 
-def reconstruct_projection_geometry(points_cam0, points_conf, est_gravity_cam, conf_threshold_percent=45.0,
-                                    xz_slice_val=2.5, density_size=EVAL_IMG_RES, padding=0.1, eps=1e-8):
+def reconstruct_projection_geometry(
+    points_cam0: NDArray[np.floating[Any]],
+    points_conf: NDArray[np.floating[Any]],
+    est_gravity_cam: NDArray[np.floating[Any]],
+    conf_threshold_percent: float = 45.0,
+    xz_slice_val: float = 2.5,
+    density_size: int = EVAL_IMG_RES,
+    padding: float = 0.1,
+    eps: float = 1e-8,
+) -> tuple[ProjParams, NDArray[np.floating[Any]], NDArray[np.bool_]]:
     """Rotates the points to the gravity-aligned ground frame, filters them and fits the top-down projection.
 
     Returns the projection parameters, the filtered points (N, 3) in the ground frame and their mask (S, H, W).
@@ -89,20 +134,20 @@ def reconstruct_projection_geometry(points_cam0, points_conf, est_gravity_cam, c
     min_x, min_z = points[:, 0].min(), points[:, 2].min()
     width_m, height_m = points[:, 0].max() - min_x, points[:, 2].max() - min_z
     scale = (density_size * (1 - padding * 2)) / max(width_m, height_m)
-    proj_params = {"R_rect": R_rect, "min_x": min_x, "min_z": min_z, "scale": scale,
-                   "cx": (density_size - width_m * scale) / 2, "cz": (density_size - height_m * scale) / 2,
-                   "density_size": density_size}
+    proj_params: ProjParams = {"R_rect": R_rect, "min_x": min_x, "min_z": min_z, "scale": scale,
+                               "cx": (density_size - width_m * scale) / 2, "cz": (density_size - height_m * scale) / 2,
+                               "density_size": density_size}
     return proj_params, points, mask.reshape(points_conf.shape)
 
 
-def get_density_coordinates(points, proj_params):
+def get_density_coordinates(points: NDArray[np.floating[Any]], proj_params: ProjParams) -> NDArray[np.float32]:
     """Ground-frame 3D points (N, 3) -> density-map pixel coordinates (N, 2)."""
     u = (points[:, 0] - proj_params["min_x"]) * proj_params["scale"] + proj_params["cx"]
     v = (points[:, 2] - proj_params["min_z"]) * proj_params["scale"] + proj_params["cz"]
     return np.stack([u, proj_params["density_size"] - 1 - v], axis=1).astype(np.float32)
 
 
-def render_density_map(points, proj_params, gamma_val=0.5):
+def render_density_map(points: NDArray[np.floating[Any]], proj_params: ProjParams, gamma_val: float = 0.5) -> Image.Image:
     """Counts the points per pixel, applies gamma correction and normalizes. Returns an RGB image (dark = dense)."""
     size = proj_params["density_size"]
     coords = get_density_coordinates(points, proj_params).astype(np.int32)
@@ -114,7 +159,7 @@ def render_density_map(points, proj_params, gamma_val=0.5):
     return Image.fromarray(np.clip(255.0 - density_map, 0, 255).astype(np.uint8)).convert("RGB")
 
 
-def intensity_sampling(density_img, num_sample_points=10000):
+def intensity_sampling(density_img: Image.Image, num_sample_points: int = 10000) -> torch.Tensor:
     """Samples query points with a probability proportional to the density (darker pixels).
 
     Returns normalized coordinates in [-1, 1], (1, N, 2), without duplicates.
@@ -130,19 +175,21 @@ def intensity_sampling(density_img, num_sample_points=10000):
     return torch.tensor(norm_pts[np.sort(unique_indices)]).unsqueeze(0)
 
 
-def sample_descriptors(features, grid_points):
+def sample_descriptors(features: torch.Tensor, grid_points: torch.Tensor) -> torch.Tensor:
     """Bilinear interpolation of features (B, C, H, W) at normalized coordinates (B, N, 2). Returns (B, N, C)."""
     sampled = F.grid_sample(features, grid_points.unsqueeze(1), mode="bilinear", align_corners=False)  # (B, C, 1, N)
     return sampled.squeeze(2).permute(0, 2, 1)
 
 
 @torch.no_grad()
-def estimate_correspondences(model, density_img, plan_img):
+def estimate_correspondences(
+    model: Any, density_img: Image.Image, plan_img: Image.Image
+) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
     """Reliable correspondences from the density map to the floorplan, in pixels (Sec. 3.3)."""
     device = next(model.parameters()).device
     feature_maps = []
     for img in (density_img, plan_img):
-        tokens = model.forward_features(norm_transform(img).unsqueeze(0).to(device))["x_norm_patchtokens"]
+        tokens = model.forward_features(norm_transform(img).unsqueeze(0).to(device))["x_norm_patchtokens"]  # type: ignore[attr-defined]
         B, N_tokens, C = tokens.shape
         grid_dim = int(np.sqrt(N_tokens))
         feature_maps.append(tokens.permute(0, 2, 1).reshape(B, C, grid_dim, grid_dim))
@@ -174,7 +221,7 @@ def estimate_correspondences(model, density_img, plan_img):
     return src_px, dst_px
 
 
-def align_to_floorplan(recon, plan_img, model):
+def align_to_floorplan(recon: ReconstructionDict | dict[str, Any], plan_img: Image.Image, model: Any) -> AlignmentDict:
     """Density map of a reconstruction, its reliable correspondences and M (density map -> floorplan pixels)."""
     proj_params, points, _ = reconstruct_projection_geometry(recon["points_cam0"], recon["conf"], recon["est_gravity_cam"])
     density_img = render_density_map(points, proj_params)
@@ -185,8 +232,13 @@ def align_to_floorplan(recon, plan_img, model):
     return {"proj_params": proj_params, "density_img": density_img, "src_px": src_px, "dst_px": dst_px, "M": M}
 
 
-def get_floorplan_aligned_scene(recon, alignment, conf_threshold_percent=90.0, y_percentiles=(1.0, 99.0),
-                                xz_slice_val=2.5):
+def get_floorplan_aligned_scene(
+    recon: ReconstructionDict | dict[str, Any],
+    alignment: PoseAlignment,
+    conf_threshold_percent: float = 90.0,
+    y_percentiles: tuple[float, float] = (1.0, 99.0),
+    xz_slice_val: float = 2.5,
+) -> AlignedSceneDict:
     """3D points and cameras in the floorplan frame: horizontal coordinates follow M, heights use the scale of M.
 
     Frame: Z up, the floorplan on the unit square [-0.5, 0.5]^2 at z = 0 (512 pixels = 1, top edge at y = 0.5).
@@ -210,7 +262,7 @@ def get_floorplan_aligned_scene(recon, alignment, conf_threshold_percent=90.0, y
     mask = (points[:, 0] >= x_min) & (points[:, 0] <= x_max) & (points[:, 2] >= z_min) & (points[:, 2] <= z_max)
     points, colors = points[mask], colors[mask]
 
-    def to_floorplan_frame(p):
+    def to_floorplan_frame(p: NDArray[np.floating[Any]]) -> NDArray[np.floating[Any]]:
         plan_px = cv2.transform(get_density_coordinates(p, proj_params).reshape(-1, 1, 2), M).reshape(-1, 2)
         return np.stack([plan_px[:, 0] / res - 0.5, 0.5 - plan_px[:, 1] / res,
                          (y_floor - p[:, 1]) * proj_params["scale"] * s_M / res], axis=1)

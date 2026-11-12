@@ -4,10 +4,13 @@
     python evaluate_c3.py --c3_root <C3> --checkpoint_dir pre-trained     # pretrained DINOv3
     python evaluate_c3.py --c3_root <C3> --recon_cache <reconstructions>  # Ours, on our cached reconstructions
 """
+from __future__ import annotations
+
 import argparse
 import json
 import os
 from collections import defaultdict
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -18,7 +21,7 @@ from scenealigner.inference import MODEL_REPO, align_to_floorplan, load_model
 from scenealigner.preprocess import load_and_resize_plan, load_models, reconstruct
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--c3_root", required=True, help="C3 dataset, with visual/ and geometric/test/")
     parser.add_argument("--test_csv", default="data/c3/test.csv")
@@ -36,8 +39,10 @@ def main():
 
     # One reconstruction per chunk of photos, in the order of the CSV
     data = pd.read_csv(args.test_csv)
-    scene_results = defaultdict(lambda: {"pred": [], "gt": [], "t_errs": [], "r_errs": []})
-    for (scene_id, chunk_idx), rows in tqdm(data.groupby(["scene_id", "chunk_idx"], sort=False)):
+    scene_results: defaultdict[str, dict[str, list[Any]]] = defaultdict(
+        lambda: {"pred": [], "gt": [], "t_errs": [], "r_errs": []}
+    )
+    for (scene_id, chunk_idx), rows in tqdm(data.groupby(["scene_id", "chunk_idx"], sort=False)):  # type: ignore[misc]
         visual_dir = os.path.join(args.c3_root, "visual", rows.scene_name.iloc[0])
         plan_img, plan_transform_params = load_and_resize_plan(os.path.join(visual_dir, rows.plan_path.iloc[0]))
         if args.recon_cache is None:
