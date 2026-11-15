@@ -7,8 +7,11 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
 import random
+import subprocess
+from collections.abc import Sequence
 from functools import partial
 from typing import TYPE_CHECKING, Any
 
@@ -191,6 +194,36 @@ def compute_loss(
     return loss, losses
 
 
+def _sync_output_to_gcs(output_dir: str, sync_gcs_uri: str) -> None:
+    """Best-effort rsync of training outputs and checkpoints to GCS."""
+    target = sync_gcs_uri.rstrip("/")
+    res = subprocess.run(
+        ["gcloud", "storage", "rsync", "--recursive", "--quiet", output_dir, target],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if res.returncode != 0:
+        err = res.stderr.strip() or f"exit code {res.returncode}"
+        getattr(tqdm, "write", print)(f"[warn] GCS checkpoint sync failed ({err})")
+
+
+def _write_train_state(output_dir: str, step: int, steps_per_epoch: int, total_epochs: int) -> None:
+    """Atomically persist training step and completed epoch progress for pipeline orchestration."""
+    os.makedirs(output_dir, exist_ok=True)
+    state_path = os.path.join(output_dir, "train_state.json")
+    tmp_path = f"{state_path}.tmp"
+    payload = {
+        "step": int(step),
+        "steps_per_epoch": int(steps_per_epoch),
+        "completed_epochs": int(step // steps_per_epoch) if steps_per_epoch > 0 else 0,
+        "total_epochs": int(total_epochs),
+    }
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    os.replace(tmp_path, state_path)
+
+
 def save_checkpoint(
     output_dir: str,
     model: Any,
@@ -199,8 +232,11 @@ def save_checkpoint(
     *,
     semantic_adapter: SemanticAdapter | None = None,
     lambda_sem: float | None = 0.0,
+    sync_gcs_uri: str | None = None,
+    steps_per_epoch: int | None = None,
+    total_epochs: int | None = None,
 ) -> None:
-    """Saves the LoRA adapter, optional semantic adapter, and an atomic training state checkpoint."""
+    """Saves the LoRA adapter, optional semantic adapter, atomic checkpoint state, and optional GCS sync."""
     model.save_pretrained(output_dir)
     payload: dict[str, Any] = {
         "step": step,
@@ -214,6 +250,10 @@ def save_checkpoint(
     tmp_path = f"{ckpt_path}.tmp"
     torch.save(payload, tmp_path)
     os.replace(tmp_path, ckpt_path)
+    if steps_per_epoch is not None and total_epochs is not None:
+        _write_train_state(output_dir, step, steps_per_epoch, total_epochs)
+    if sync_gcs_uri:
+        _sync_output_to_gcs(output_dir, sync_gcs_uri)
 
 
 def compute_epoch_schedule(dataset_len: int, epochs: int, batch_size: int = 4) -> tuple[int, int]:
@@ -232,6 +272,25 @@ def should_save_mid_epoch(step: int, save_every: int, steps_per_epoch: int) -> b
 def epoch_sample_order(dataset_len: int, epoch: int, seed: int) -> list[int]:
     """Deterministic per-epoch sample permutation so interrupted epochs resume identically."""
     return torch.randperm(dataset_len, generator=torch.Generator().manual_seed(seed + epoch)).tolist()
+
+
+def parse_scene_ranges(specs: Sequence[str] | None) -> list[tuple[int, int]] | None:
+    """Parse CLI START:END half-open scene interval specs into (start, end) tuples."""
+    if specs is None:
+        return None
+    ranges: list[tuple[int, int]] = []
+    for raw in specs:
+        parts = raw.strip().split(":")
+        if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
+            raise ValueError(f"Invalid --scene_ranges entry {raw!r}: expected START:END")
+        try:
+            start, end = int(parts[0]), int(parts[1])
+        except ValueError as err:
+            raise ValueError(f"Invalid --scene_ranges entry {raw!r}: expected integer bounds") from err
+        if start < 0 or end <= start:
+            raise ValueError(f"Invalid --scene_ranges interval {raw!r}: expected 0 <= start < end")
+        ranges.append((start, end))
+    return ranges
 
 
 def main() -> None:
@@ -256,6 +315,19 @@ def main() -> None:
     parser.add_argument("--sem_dim", type=int, default=128, help="output dimensionality of SemanticAdapter")
     parser.add_argument("--init_lora", default="pre-trained", help="LoRA checkpoint dir/HF repo or 'pre-trained'")
     parser.add_argument("--freeze_lora", action="store_true", help="freeze LoRA weights and train only SemanticAdapter")
+    parser.add_argument(
+        "--scene_ranges",
+        nargs="+",
+        default=None,
+        help="optional START:END half-open scene intervals to filter training CSVs",
+    )
+    parser.add_argument("--sync_gcs_uri", default=None, help="optional gs://... directory URI to rsync after each checkpoint save")
+    parser.add_argument(
+        "--stop_after_epoch",
+        type=int,
+        default=None,
+        help="stop cleanly after completing this 1-based epoch index while keeping total_steps based on --epochs",
+    )
     args = parser.parse_args()
 
     sem_mode: SemMode = args.sem_mode
@@ -269,6 +341,9 @@ def main() -> None:
         raise ValueError("--sem_mode != 'none' requires --lambda_sem > 0 or --alpha_sem > 0 to supervise SemanticAdapter.")
     if any(r <= 0 or r % 16 != 0 for r in args.resolutions):
         raise ValueError(f"All --resolutions must be positive multiples of 16, got {args.resolutions}")
+    if args.stop_after_epoch is not None and (args.stop_after_epoch < 1 or args.stop_after_epoch > args.epochs):
+        raise ValueError(f"--stop_after_epoch must be in 1..{args.epochs}, got {args.stop_after_epoch}")
+    scene_ranges = parse_scene_ranges(args.scene_ranges)
     use_semantics = (sem_mode != "none" and eff_lambda > 0.0) or alpha_sem > 0.0
 
     random.seed(args.seed)
@@ -276,7 +351,11 @@ def main() -> None:
     torch.manual_seed(args.seed)
     image_size = args.resolutions[0] if len(args.resolutions) == 1 else None
     dataset = DensityFloorplanDataset(
-        args.data, min_points=args.min_points, image_size=image_size, load_semantics=use_semantics
+        args.data,
+        min_points=args.min_points,
+        image_size=image_size,
+        load_semantics=use_semantics,
+        scene_ranges=scene_ranges,
     )
     collate_fn = partial(collate, resolutions=args.resolutions)
     steps_per_epoch, total_steps = compute_epoch_schedule(len(dataset), args.epochs, batch_size=4)
@@ -329,8 +408,9 @@ def main() -> None:
         log.writerow(["step", "loss", *loss_cols])
 
     start_epoch = step // steps_per_epoch
+    target_end_epoch = args.epochs if args.stop_after_epoch is None else args.stop_after_epoch
     saved_lambda = eff_lambda if sem_mode != "none" else None
-    for epoch in range(start_epoch, args.epochs):
+    for epoch in range(start_epoch, target_end_epoch):
         skip_steps = step % steps_per_epoch if epoch == start_epoch else 0
         perm = epoch_sample_order(len(dataset), epoch=epoch, seed=args.seed)
         loader = DataLoader(Subset(dataset, perm[skip_steps * 4:]), batch_size=4, shuffle=False, num_workers=4, collate_fn=collate_fn)
@@ -354,9 +434,57 @@ def main() -> None:
                 log.writerow([step, loss.item()] + [losses[k].item() if k in losses else "" for k in loss_cols])
             if should_save_mid_epoch(step, args.save_every, steps_per_epoch):
                 save_checkpoint(
-                    args.output, model, optimizer, step, semantic_adapter=semantic_adapter, lambda_sem=saved_lambda
+                    args.output,
+                    model,
+                    optimizer,
+                    step,
+                    semantic_adapter=semantic_adapter,
+                    lambda_sem=saved_lambda,
+                    sync_gcs_uri=args.sync_gcs_uri,
+                    steps_per_epoch=steps_per_epoch,
+                    total_epochs=args.epochs,
                 )
-        save_checkpoint(args.output, model, optimizer, step, semantic_adapter=semantic_adapter, lambda_sem=saved_lambda)
+        save_checkpoint(
+            args.output,
+            model,
+            optimizer,
+            step,
+            semantic_adapter=semantic_adapter,
+            lambda_sem=saved_lambda,
+            sync_gcs_uri=args.sync_gcs_uri,
+            steps_per_epoch=steps_per_epoch,
+            total_epochs=args.epochs,
+        )
+
+    if args.resume and start_epoch >= target_end_epoch:
+        repaired_exports = False
+        if not os.path.exists(os.path.join(args.output, "adapter_config.json")) or not os.path.exists(
+            os.path.join(args.output, "adapter_model.safetensors")
+        ):
+            model.save_pretrained(args.output)
+            repaired_exports = True
+        if semantic_adapter is not None and not os.path.exists(os.path.join(args.output, "semantic_adapter.pt")):
+            save_semantic_adapter(args.output, semantic_adapter, lambda_sem=saved_lambda)
+            repaired_exports = True
+        state_path = os.path.join(args.output, "train_state.json")
+        write_state = True
+        if os.path.exists(state_path):
+            try:
+                with open(state_path, encoding="utf-8") as f:
+                    cur_state = json.load(f)
+                write_state = (
+                    not isinstance(cur_state, dict)
+                    or cur_state.get("step") != int(step)
+                    or cur_state.get("steps_per_epoch") != int(steps_per_epoch)
+                    or cur_state.get("total_epochs") != int(args.epochs)
+                )
+            except (OSError, json.JSONDecodeError, TypeError):
+                write_state = True
+        if write_state:
+            _write_train_state(args.output, step, steps_per_epoch, args.epochs)
+            repaired_exports = True
+        if repaired_exports and args.sync_gcs_uri:
+            _sync_output_to_gcs(args.output, args.sync_gcs_uri)
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ from __future__ import annotations
 import glob
 import os
 import random
+import re
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, NotRequired, TypedDict
 
@@ -110,6 +111,16 @@ def _resize_sem_nearest(
     return resized_idx, resized_rel
 
 
+_TRAILING_INT_RE = re.compile(r"(\d+)$")
+_SLICE_CSV_RE = re.compile(r"^scenes_(\d+)_(\d+)\.csv$")
+
+
+def _parse_scene_num(scene_id: str) -> int | None:
+    """Extract the trailing integer scene index from a scene_id like 'scene_00123'."""
+    match = _TRAILING_INT_RE.search(str(scene_id).strip())
+    return int(match.group(1)) if match else None
+
+
 class DensityFloorplanDataset(Dataset[TrainingSampleDict]):
     """Pairs of a density map and a floorplan with their correspondences, listed in the CSV files of a folder."""
 
@@ -120,14 +131,53 @@ class DensityFloorplanDataset(Dataset[TrainingSampleDict]):
         min_points: int = 10000,
         image_size: int | None = None,
         load_semantics: bool = False,
+        scene_ranges: Sequence[tuple[int, int]] | None = None,
     ) -> None:
         self.root = root
         self.num_points = num_points
         self.min_points = min_points
         self.image_size = image_size
         self.load_semantics = load_semantics
-        files = sorted(glob.glob(os.path.join(root, "*.csv")))
+        normalized_ranges: list[tuple[int, int]] | None = None
+        if scene_ranges is not None:
+            normalized_ranges = [(int(lo), int(hi)) for lo, hi in scene_ranges]
+            for lo, hi in normalized_ranges:
+                if lo < 0 or hi <= lo:
+                    raise ValueError(f"Invalid scene range {(lo, hi)}: expected 0 <= start < end")
+        self.scene_ranges = normalized_ranges
+
+        all_files = sorted(glob.glob(os.path.join(root, "*.csv")))
+        if not all_files:
+            raise ValueError(f"No CSV files found in {root}")
+        if normalized_ranges is not None:
+            files = []
+            for f in all_files:
+                m = _SLICE_CSV_RE.match(os.path.basename(f))
+                if m:
+                    s0, s1 = int(m.group(1)), int(m.group(2))
+                    if not any(s0 < hi and s1 > lo for lo, hi in normalized_ranges):
+                        continue
+                files.append(f)
+            if not files:
+                raise ValueError(f"No CSV files in {root} overlap scene_ranges={normalized_ranges}")
+        else:
+            files = all_files
+
         self.data = pd.concat([pd.read_csv(f) for f in files], ignore_index=True)
+        # Drop duplicate view entries when slice CSVs overlap across resumed runs
+        self.data = self.data.drop_duplicates(subset=["scene_id", "density"], ignore_index=True)
+        if normalized_ranges is not None:
+            keep_mask: list[bool] = []
+            for sid in self.data["scene_id"]:
+                num = _parse_scene_num(str(sid))
+                if num is None:
+                    raise ValueError(
+                        f"Cannot filter by scene_ranges={normalized_ranges}: non-numeric scene_id {sid!r}"
+                    )
+                keep_mask.append(any(lo <= num < hi for lo, hi in normalized_ranges))
+            self.data = self.data[np.asarray(keep_mask, dtype=bool)].reset_index(drop=True)
+        if len(self.data) == 0:
+            raise ValueError(f"No training samples found in {root} for scene_ranges={normalized_ranges}")
         if self.load_semantics:
             missing = [col for col in ("density_sem", "floorplan_sem") if col not in self.data.columns]
             if missing:
