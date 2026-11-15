@@ -10,12 +10,16 @@ import os
 from typing import Any
 
 import numpy as np
+import torch
 from tqdm import tqdm
 
 from scenealigner import structured3d as s3d
 from scenealigner.evaluation import compute_pose_error_analytic, get_camera_center_on_density_px
-from scenealigner.inference import S3D_MODEL_REPO, PoseAlignment, align_to_floorplan, load_model, reconstruct_projection_geometry
+from scenealigner.inference import (S3D_MODEL_REPO, AlignmentFailureError, PoseAlignment, SemanticAdapter,
+                                   SemanticMapInput, SemMode, align_to_floorplan, load_model, load_semantic_adapter,
+                                   reconstruct_projection_geometry)
 from scenealigner.preprocess import ReconstructionDict, load_models, reconstruct
+from scenealigner.semantics import DEFAULT_CLIP_MODEL, ClipTextEncoder
 
 
 def pose_errors(
@@ -46,21 +50,99 @@ def main() -> None:
     parser.add_argument("--checkpoint_dir", default=S3D_MODEL_REPO, help="LoRA layers")
     parser.add_argument("--dinov3_weights", default=None, help="Meta's DINOv3 ViT-B/16 weights")
     parser.add_argument("--output", default="outputs/s3d_results.json")
+    parser.add_argument("--sem_mode", choices=["none", "uniform", "consensus"], default="none")
+    parser.add_argument("--photo_sem_source", choices=["gt", "none"], default="gt")
+    parser.add_argument(
+        "--semantic_adapter",
+        default=None,
+        help="path or directory for semantic_adapter.pt (defaults to --checkpoint_dir when --sem_mode != none)",
+    )
+    parser.add_argument(
+        "--lambda_sem",
+        type=float,
+        default=None,
+        help="semantic weight at inference (defaults to checkpoint metadata or 0.5)",
+    )
+    parser.add_argument("--include_rooms", action="store_true", help="include room-type semantics on the floorplan")
+    parser.add_argument(
+        "--structural_photo_semantics",
+        action="store_true",
+        help="restrict photo GT semantics to structural classes (wall/door/window)",
+    )
+    parser.add_argument("--clip_model", default=DEFAULT_CLIP_MODEL, help="OpenCLIP model identifier")
     args = parser.parse_args()
+
+    if args.lambda_sem is not None and args.lambda_sem < 0.0:
+        raise ValueError(f"--lambda_sem must be non-negative, got {args.lambda_sem}")
 
     np.random.seed(42)
     recon_model, geocalib = load_models(recon_model="pi3-original")
     model = load_model(args.checkpoint_dir, args.dinov3_weights)
 
+    sem_mode: SemMode = args.sem_mode
+    use_semantics = sem_mode != "none" and args.photo_sem_source != "none"
+    semantic_adapter: SemanticAdapter | None = None
+    text_encoder: ClipTextEncoder | None = None
+    eff_lambda = 0.5
+    if use_semantics:
+        fallback_dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        try:
+            device = next(model.parameters()).device if hasattr(model, "parameters") else fallback_dev
+        except StopIteration:
+            device = fallback_dev
+        adapter_src = args.semantic_adapter or args.checkpoint_dir
+        semantic_adapter, saved_lambda = load_semantic_adapter(adapter_src, device=device)
+        semantic_adapter.eval()
+        if args.lambda_sem is not None:
+            eff_lambda = float(args.lambda_sem)
+        elif saved_lambda is not None and saved_lambda > 0.0:
+            eff_lambda = saved_lambda
+        else:
+            eff_lambda = 0.5
+        if eff_lambda < 0.0:
+            raise ValueError(f"lambda_sem must be non-negative, got {eff_lambda}")
+        text_encoder = ClipTextEncoder(args.clip_model)
+
     t_errs, r_errs, failed = [], [], 0
     for scene in tqdm(s3d.TEST_SCENES):
         scene_dir = os.path.join(args.s3d_root, f"scene_{scene:05d}")
         plan_img, plan_params = s3d.load_floorplan(scene_dir)
+        plan_sem: SemanticMapInput | None = None
+        if use_semantics:
+            assert text_encoder is not None
+            plan_sem_idx, plan_palette, _ = s3d.load_semantic_floorplan(
+                scene_dir,
+                text_encoder=text_encoder,
+                include_rooms=args.include_rooms,
+                plan_params=plan_params,
+            )
+            plan_sem = (plan_sem_idx, plan_palette, None)
+
         for view_dir in s3d.list_views(scene_dir):
             recon = reconstruct([os.path.join(view_dir, "rgb_rawlight.png")], recon_model, geocalib)
             try:
-                alignment = align_to_floorplan(recon, plan_img, model)
-            except ValueError:  # no similarity transform: the identity is used
+                if use_semantics:
+                    assert text_encoder is not None and semantic_adapter is not None
+                    allowed = s3d.STRUCTURAL_PHOTO_LABELS if args.structural_photo_semantics else None
+                    p_idx, p_palette, _ = s3d.load_view_gt_semantics(
+                        view_dir, text_encoder=text_encoder, allowed_labels=allowed
+                    )
+                    if p_idx.ndim == 2 and recon["conf"].ndim == 3:
+                        p_idx = p_idx[None, ...]
+                    photo_sem: SemanticMapInput = (p_idx, p_palette, recon["conf"])
+                    alignment = align_to_floorplan(
+                        recon,
+                        plan_img,
+                        model,
+                        sem_mode=sem_mode,
+                        semantic_adapter=semantic_adapter,
+                        photo_sem=photo_sem,
+                        plan_sem=plan_sem,
+                        lambda_sem=eff_lambda,
+                    )
+                else:
+                    alignment = align_to_floorplan(recon, plan_img, model)
+            except AlignmentFailureError:  # no similarity transform: the identity is used
                 proj_params = reconstruct_projection_geometry(recon["points_cam0"], recon["conf"], recon["est_gravity_cam"])[0]
                 alignment: PoseAlignment = {"proj_params": proj_params, "M": np.eye(2, 3)}
                 failed += 1

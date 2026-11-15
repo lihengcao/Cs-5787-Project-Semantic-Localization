@@ -188,6 +188,8 @@ def _pool_patches_numpy(
         raise ValueError(f"sem_idx must be 2D or 3D, got shape={sem_idx.shape}")
     if patch_size <= 0:
         raise ValueError(f"patch_size must be positive, got {patch_size}")
+    if sem_rel is not None and sem_rel.shape != sem_idx.shape:
+        raise ValueError(f"sem_rel shape {sem_rel.shape} must match sem_idx shape {sem_idx.shape}")
 
     squeeze = sem_idx.ndim == 2
     if squeeze:
@@ -200,22 +202,44 @@ def _pool_patches_numpy(
         raise ValueError(f"sem_idx spatial dims {(h, w)} must be divisible by patch_size={patch_size}")
     if palette.ndim not in (2, 3):
         raise ValueError(f"palette must be 2D or 3D, got shape={palette.shape}")
+    if palette.ndim == 3 and palette.shape[0] != bsz:
+        raise ValueError(f"3D palette batch size ({palette.shape[0]}) must match sem_idx batch size ({bsz})")
 
     hp, wp = h // patch_size, w // patch_size
-    embed_dim = palette.shape[-1]
+    n_patches = hp * wp
+    p2 = patch_size * patch_size
+    num_pal, embed_dim = palette.shape[-2], palette.shape[-1]
+    if sem_idx.size > 0 and (int(sem_idx.min()) < 0 or int(sem_idx.max()) >= num_pal):
+        raise ValueError(f"sem_idx values must lie in [0, {num_pal - 1}]")
 
     active = sem_idx > 0
     rel = active.astype(np.float32) if sem_rel is None else (sem_rel.astype(np.float32) * active)
 
-    if palette.ndim == 2:
-        pix_emb = palette[sem_idx.astype(np.int64)].astype(np.float32)
-    else:
-        batch_ids = np.arange(bsz)[:, None, None]
-        pix_emb = palette[batch_ids, sem_idx.astype(np.int64)].astype(np.float32)
+    idx_p = (
+        np.ascontiguousarray(sem_idx, dtype=np.int64)
+        .reshape(bsz, hp, patch_size, wp, patch_size)
+        .transpose(0, 1, 3, 2, 4)
+        .reshape(bsz, n_patches, p2)
+    )
+    rel_p = (
+        np.ascontiguousarray(rel, dtype=np.float32)
+        .reshape(bsz, hp, patch_size, wp, patch_size)
+        .transpose(0, 1, 3, 2, 4)
+        .reshape(bsz, n_patches, p2)
+    )
+    b_ids = np.arange(bsz, dtype=np.int64)[:, None, None]
+    p_ids = np.arange(n_patches, dtype=np.int64)[None, :, None]
+    flat_bins = ((b_ids * n_patches + p_ids) * num_pal + idx_p).ravel()
+    patch_weights = (
+        np.bincount(flat_bins, weights=rel_p.ravel(), minlength=bsz * n_patches * num_pal)
+        .astype(np.float32)
+        .reshape(bsz, n_patches, num_pal)
+    )
+    patch_weights[:, :, 0] = 0.0
 
-    weighted = pix_emb * rel[..., None]
-    weighted_p = weighted.reshape(bsz, hp, patch_size, wp, patch_size, embed_dim).sum(axis=(2, 4))
-    active_count = active.astype(np.float32).reshape(bsz, hp, patch_size, wp, patch_size).sum(axis=(2, 4))
+    pal_f32 = palette.astype(np.float32, copy=False)
+    weighted_p = np.matmul(patch_weights, pal_f32).reshape(bsz, hp, wp, embed_dim)
+    active_count = np.ascontiguousarray(active, dtype=np.float32).reshape(bsz, hp, patch_size, wp, patch_size).sum(axis=(2, 4))
     norms = np.linalg.norm(weighted_p, axis=-1, keepdims=True)
     patch_rel = np.clip(norms[..., 0] / np.maximum(active_count, 1.0), 0.0, 1.0)[:, None, :, :].astype(np.float32)
 
@@ -252,19 +276,25 @@ def pool_semantic_patches(
 ) -> tuple[NDArray[np.float32], NDArray[np.float32]] | tuple[torch.Tensor, torch.Tensor]:
     """Gather per-pixel CLIP embeddings and pool into (D, H/p, W/p) features + active-pixel reliability."""
     if isinstance(sem_idx, np.ndarray):
-        assert isinstance(palette, np.ndarray)
-        assert sem_rel is None or isinstance(sem_rel, np.ndarray)
+        if not isinstance(palette, np.ndarray):
+            raise TypeError("palette must be a numpy.ndarray when sem_idx is a numpy.ndarray")
+        if sem_rel is not None and not isinstance(sem_rel, np.ndarray):
+            raise TypeError("sem_rel must be a numpy.ndarray when sem_idx is a numpy.ndarray")
         return _pool_patches_numpy(sem_idx, palette, sem_rel, patch_size)
 
-    import torch
+    import torch  # lazy import to avoid possible cyclic deps
 
-    assert not isinstance(palette, np.ndarray)
-    assert sem_rel is None or not isinstance(sem_rel, np.ndarray)
+    if isinstance(palette, np.ndarray):
+        raise TypeError("palette must be a torch.Tensor when sem_idx is a torch.Tensor")
+    if isinstance(sem_rel, np.ndarray):
+        raise TypeError("sem_rel must be a torch.Tensor when sem_idx is a torch.Tensor")
 
     if sem_idx.ndim not in (2, 3):
         raise ValueError(f"sem_idx must be 2D or 3D, got shape={tuple(sem_idx.shape)}")
     if patch_size <= 0:
         raise ValueError(f"patch_size must be positive, got {patch_size}")
+    if sem_rel is not None and sem_rel.shape != sem_idx.shape:
+        raise ValueError(f"sem_rel shape {tuple(sem_rel.shape)} must match sem_idx shape {tuple(sem_idx.shape)}")
 
     squeeze = sem_idx.ndim == 2
     if squeeze:
@@ -277,23 +307,27 @@ def pool_semantic_patches(
         raise ValueError(f"sem_idx spatial dims {(h, w)} must be divisible by patch_size={patch_size}")
     if palette.ndim not in (2, 3):
         raise ValueError(f"palette must be 2D or 3D, got shape={tuple(palette.shape)}")
+    if palette.ndim == 3 and palette.shape[0] != bsz:
+        raise ValueError(f"3D palette batch size ({palette.shape[0]}) must match sem_idx batch size ({bsz})")
 
     hp, wp = h // patch_size, w // patch_size
-    embed_dim = palette.shape[-1]
+    n_patches = hp * wp
+    p2 = patch_size * patch_size
+    num_pal, embed_dim = palette.shape[-2], palette.shape[-1]
+    if sem_idx.numel() > 0 and (int(sem_idx.min().item()) < 0 or int(sem_idx.max().item()) >= num_pal):
+        raise ValueError(f"sem_idx values must lie in [0, {num_pal - 1}]")
 
     active = sem_idx > 0
     rel = active.float() if sem_rel is None else (sem_rel.float() * active)
 
-    pal_3d = palette.unsqueeze(0).expand(bsz, -1, -1) if palette.ndim == 2 else palette
-    idx_flat = sem_idx.long().reshape(bsz, h * w)
-    pix_emb = torch.gather(
-        pal_3d.float(),
-        1,
-        idx_flat.unsqueeze(-1).expand(-1, -1, embed_dim),
-    ).reshape(bsz, h, w, embed_dim)
+    idx_p = sem_idx.long().reshape(bsz, hp, patch_size, wp, patch_size).permute(0, 1, 3, 2, 4).reshape(bsz, n_patches, p2)
+    rel_p = rel.reshape(bsz, hp, patch_size, wp, patch_size).permute(0, 1, 3, 2, 4).reshape(bsz, n_patches, p2)
+    patch_weights = torch.zeros(bsz, n_patches, num_pal, dtype=torch.float32, device=sem_idx.device)
+    patch_weights.scatter_add_(2, idx_p, rel_p)
+    patch_weights[:, :, 0] = 0.0
 
-    weighted = (pix_emb * rel.unsqueeze(-1)).permute(0, 3, 1, 2)  # (B, D, H, W)
-    weighted_p = weighted.reshape(bsz, embed_dim, hp, patch_size, wp, patch_size).sum(dim=(3, 5))
+    pal_3d = palette.unsqueeze(0).expand(bsz, -1, -1) if palette.ndim == 2 else palette
+    weighted_p = torch.bmm(patch_weights, pal_3d.float()).reshape(bsz, hp, wp, embed_dim).permute(0, 3, 1, 2)
     active_count = active.float().reshape(bsz, hp, patch_size, wp, patch_size).sum(dim=(2, 4)).unsqueeze(1)
 
     norms = weighted_p.norm(p=2, dim=1, keepdim=True)

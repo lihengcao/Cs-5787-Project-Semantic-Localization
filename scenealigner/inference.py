@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING, Any, NotRequired, TypedDict
+from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict
 
 import cv2
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from dinov3.hub.backbones import dinov3_vitb16
 from huggingface_hub import hf_hub_download, snapshot_download
@@ -16,6 +17,8 @@ from peft import PeftModel
 from PIL import Image
 from safetensors.torch import load_file
 from torchvision import transforms as T
+
+from .semantics import CLIP_EMBED_DIM, pool_semantic_patches, project_posed_semantics
 
 if TYPE_CHECKING:
     from .preprocess import ReconstructionDict
@@ -49,6 +52,14 @@ class AlignedSceneDict(TypedDict):
     thumbnails: NotRequired[NDArray[np.uint8]]
     image_sizes: NotRequired[NDArray[np.integer[Any]]]
     color: NotRequired[NDArray[np.integer[Any]]]
+
+
+SemMode = Literal["none", "uniform", "consensus"]
+SemanticMapInput = tuple[NDArray[np.integer[Any]], NDArray[np.floating[Any]], NDArray[np.floating[Any]] | None]
+
+
+class AlignmentFailureError(ValueError):
+    """Raised when geometric estimation (e.g., RANSAC) fails to find a valid transform."""
 
 MODEL_REPO = "jhcho99/SceneAligner"  # our LoRA layers
 S3D_MODEL_REPO = "jhcho99/SceneAligner/structured3d"  # our LoRA layers for Structured3D
@@ -181,11 +192,189 @@ def sample_descriptors(features: torch.Tensor, grid_points: torch.Tensor) -> tor
     return sampled.squeeze(2).permute(0, 2, 1)
 
 
+def normalize_active_descriptors(desc: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """L2-normalize non-zero descriptors along the last axis while preserving zero vectors."""
+    norms = desc.norm(p=2, dim=-1, keepdim=True)
+    return torch.where(norms > eps, desc / norms.clamp(min=eps), torch.zeros_like(desc))
+
+
+class SemanticAdapter(nn.Module):
+    """Shared projection MLP mapping pooled 512-D CLIP patch vectors to L2-normalized semantic descriptors."""
+
+    def __init__(self, in_dim: int = CLIP_EMBED_DIM, hidden_dim: int = 256, out_dim: int = 128) -> None:
+        super().__init__()
+        self.in_dim = in_dim
+        self.hidden_dim = hidden_dim
+        self.out_dim = out_dim
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, out_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        active = x.norm(p=2, dim=-1, keepdim=True) > 1e-6
+        projected = F.normalize(self.net(x), p=2, dim=-1, eps=1e-6)
+        return torch.where(active, projected, torch.zeros_like(projected))
+
+    def forward_map(self, feat_map: torch.Tensor) -> torch.Tensor:
+        """Project spatial CLIP patch features (B, C, H, W) -> (B, out_dim, H, W)."""
+        return self.forward(feat_map.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+
+
+def save_semantic_adapter(output_dir: str, adapter: SemanticAdapter, lambda_sem: float | None = 0.5) -> str:
+    """Atomically save SemanticAdapter weights and config metadata into <output_dir>/semantic_adapter.pt."""
+    if lambda_sem is not None and lambda_sem < 0.0:
+        raise ValueError(f"lambda_sem must be non-negative, got {lambda_sem}")
+    os.makedirs(output_dir, exist_ok=True)
+    ckpt_path = os.path.join(output_dir, "semantic_adapter.pt")
+    tmp_path = f"{ckpt_path}.tmp"
+    torch.save(
+        {
+            "state_dict": adapter.state_dict(),
+            "in_dim": adapter.in_dim,
+            "hidden_dim": adapter.hidden_dim,
+            "out_dim": adapter.out_dim,
+            "lambda_sem": None if lambda_sem is None else float(lambda_sem),
+        },
+        tmp_path,
+    )
+    os.replace(tmp_path, ckpt_path)
+    return ckpt_path
+
+
+def load_semantic_adapter(
+    path_or_dir: str, device: torch.device | str = "cuda"
+) -> tuple[SemanticAdapter, float | None]:
+    """Load SemanticAdapter from a directory, checkpoint file, or HuggingFace repo with weights_only=True."""
+    if os.path.isdir(path_or_dir):
+        ckpt_path = os.path.join(path_or_dir, "semantic_adapter.pt")
+        if not os.path.isfile(ckpt_path):
+            raise FileNotFoundError(f"SemanticAdapter checkpoint not found: {ckpt_path}")
+    elif os.path.isfile(path_or_dir):
+        ckpt_path = path_or_dir
+    elif path_or_dir.startswith((".", "/", "~")) or path_or_dir.endswith(".pt") or "/" not in path_or_dir:
+        if "/" not in path_or_dir:
+            ckpt_path = hf_hub_download(path_or_dir, filename="semantic_adapter.pt")
+        else:
+            raise FileNotFoundError(f"SemanticAdapter checkpoint path not found: {path_or_dir}")
+    elif path_or_dir.count("/") > 1:
+        parts = path_or_dir.split("/")
+        repo, subfolder = "/".join(parts[:2]), "/".join(parts[2:])
+        ckpt_path = hf_hub_download(repo, filename=f"{subfolder}/semantic_adapter.pt")
+    else:
+        ckpt_path = hf_hub_download(path_or_dir, filename="semantic_adapter.pt")
+
+    payload = torch.load(ckpt_path, map_location=device, weights_only=True)
+    if isinstance(payload, dict) and "state_dict" in payload:
+        state_dict = payload["state_dict"]
+        in_dim = int(payload.get("in_dim", CLIP_EMBED_DIM))
+        hidden_dim = int(payload.get("hidden_dim", 256))
+        out_dim = int(payload.get("out_dim", 128))
+        raw_lambda = payload.get("lambda_sem")
+        lambda_sem = float(raw_lambda) if raw_lambda is not None else None
+    else:
+        state_dict = payload
+        in_dim, hidden_dim, out_dim, lambda_sem = CLIP_EMBED_DIM, 256, 128, None
+
+    adapter = SemanticAdapter(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=out_dim)
+    adapter.load_state_dict(state_dict)
+    return adapter.to(device).eval(), lambda_sem
+
+
+def compute_fused_sim_matrix(
+    desc_geo_d: torch.Tensor,
+    map_geo_p: torch.Tensor,
+    *,
+    sem_mode: SemMode = "none",
+    desc_sem_d: torch.Tensor | None = None,
+    map_sem_p: torch.Tensor | None = None,
+    rel_d: torch.Tensor | None = None,
+    map_rel_p: torch.Tensor | None = None,
+    lambda_sem: float = 0.5,
+) -> torch.Tensor:
+    """Compute patch similarity S_ij = <g_d, g_p> + lambda_sem * w_ij * <s_d, s_p>."""
+    if sem_mode not in ("none", "uniform", "consensus"):
+        raise ValueError(f"Unsupported sem_mode: {sem_mode!r}")
+    if lambda_sem < 0.0:
+        raise ValueError(f"lambda_sem must be non-negative, got {lambda_sem}")
+    flat_p = F.normalize(map_geo_p.flatten(2).permute(0, 2, 1), dim=-1)
+    sim = torch.matmul(F.normalize(desc_geo_d, dim=-1), flat_p.transpose(1, 2))
+    if sem_mode == "none" or lambda_sem == 0.0 or desc_sem_d is None or map_sem_p is None:
+        return sim
+
+    s_d = normalize_active_descriptors(desc_sem_d)
+    flat_s_p = normalize_active_descriptors(map_sem_p.flatten(2).permute(0, 2, 1))
+    sem_sim = torch.matmul(s_d, flat_s_p.transpose(1, 2))
+    if sem_mode == "consensus":
+        if rel_d is None or map_rel_p is None:
+            raise ValueError("sem_mode='consensus' requires both rel_d and map_rel_p")
+        bsz = desc_geo_d.shape[0]
+        gate = rel_d.reshape(bsz, -1, 1).clamp(0.0, 1.0) * map_rel_p.flatten(2).clamp(0.0, 1.0)
+        sem_sim = sem_sim * gate
+    return sim + lambda_sem * sem_sim
+
+
+def _pool_and_adapt_map(
+    sem_tuple: SemanticMapInput,
+    adapter: SemanticAdapter,
+    target_size: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    sem_idx, palette, sem_rel = sem_tuple
+    raw_idx = np.asarray(sem_idx)
+    pal_arr = np.asarray(palette, dtype=np.float32)
+    if raw_idx.ndim != 2 or not np.issubdtype(raw_idx.dtype, np.integer):
+        raise ValueError(f"Expected 2D integer semantic index map, got shape={raw_idx.shape} dtype={raw_idx.dtype}")
+    if pal_arr.ndim != 2:
+        raise ValueError(f"Expected 2D palette array, got shape={pal_arr.shape}")
+    num_pal = pal_arr.shape[0]
+    if raw_idx.size > 0 and (int(raw_idx.min()) < 0 or int(raw_idx.max()) >= num_pal):
+        raise ValueError(f"Semantic index values must lie in [0, {num_pal - 1}]")
+    idx_arr = raw_idx.astype(np.uint8, copy=False)
+    if idx_arr.shape != (target_size, target_size):
+        idx_arr = np.asarray(
+            Image.fromarray(idx_arr).resize((target_size, target_size), Image.Resampling.NEAREST), dtype=np.uint8
+        )
+    rel_arr: NDArray[np.float32] | None = None
+    if sem_rel is not None:
+        rel_arr = np.asarray(sem_rel, dtype=np.float32)
+        if rel_arr.shape != raw_idx.shape:
+            raise ValueError(f"sem_rel shape {rel_arr.shape} must match sem_idx shape {raw_idx.shape}")
+        if rel_arr.shape != (target_size, target_size):
+            rel_arr = np.asarray(
+                Image.fromarray(rel_arr).resize((target_size, target_size), Image.Resampling.NEAREST), dtype=np.float32
+            )
+    patch_feat, patch_rel = pool_semantic_patches(idx_arr, pal_arr, rel_arr, patch_size=16)
+    feat_t = torch.from_numpy(patch_feat).unsqueeze(0).to(device)
+    rel_t = torch.from_numpy(patch_rel).unsqueeze(0).to(device)
+    return adapter.forward_map(feat_t), rel_t
+
+
 @torch.no_grad()
 def estimate_correspondences(
-    model: Any, density_img: Image.Image, plan_img: Image.Image
+    model: Any,
+    density_img: Image.Image,
+    plan_img: Image.Image,
+    *,
+    sem_mode: SemMode = "none",
+    semantic_adapter: SemanticAdapter | None = None,
+    density_sem: SemanticMapInput | None = None,
+    plan_sem: SemanticMapInput | None = None,
+    lambda_sem: float = 0.5,
 ) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
     """Reliable correspondences from the density map to the floorplan, in pixels (Sec. 3.3)."""
+    if sem_mode not in ("none", "uniform", "consensus"):
+        raise ValueError(f"Unsupported sem_mode: {sem_mode!r}")
+    if lambda_sem < 0.0:
+        raise ValueError(f"lambda_sem must be non-negative, got {lambda_sem}")
+    if sem_mode != "none":
+        if (density_sem is None) != (plan_sem is None):
+            raise ValueError("Both density_sem and plan_sem must be provided together when sem_mode != 'none'")
+        if semantic_adapter is not None and (density_sem is None or plan_sem is None):
+            raise ValueError("density_sem and plan_sem are required when semantic_adapter is provided with sem_mode != 'none'")
+
     device = next(model.parameters()).device
     feature_maps = []
     for img in (density_img, plan_img):
@@ -198,8 +387,33 @@ def estimate_correspondences(
     # Cosine similarity between query descriptors of the density map and all floorplan patches
     src_pts_norm = intensity_sampling(density_img).to(device)  # (1, N, 2)
     desc_d = F.normalize(sample_descriptors(map_d, src_pts_norm), dim=-1)  # (1, N, C)
-    flat_p = F.normalize(map_p.flatten(2).permute(0, 2, 1), dim=-1)  # (1, HW, C)
-    sim_matrix = torch.matmul(desc_d, flat_p.transpose(1, 2))  # (1, N, HW)
+    desc_sem_d: torch.Tensor | None = None
+    map_sem_p: torch.Tensor | None = None
+    rel_d: torch.Tensor | None = None
+    map_rel_p: torch.Tensor | None = None
+    if sem_mode != "none" and density_sem is not None and plan_sem is not None:
+        if semantic_adapter is None:
+            raise ValueError("semantic_adapter is required when sem_mode != 'none' and semantic maps are provided")
+        was_training = semantic_adapter.training
+        semantic_adapter.eval()
+        try:
+            map_sem_d, map_rel_d = _pool_and_adapt_map(density_sem, semantic_adapter, map_d.shape[-1] * 16, device)
+            map_sem_p, map_rel_p = _pool_and_adapt_map(plan_sem, semantic_adapter, map_p.shape[-1] * 16, device)
+            desc_sem_d = sample_descriptors(map_sem_d, src_pts_norm)
+            if sem_mode == "consensus":
+                rel_d = sample_descriptors(map_rel_d, src_pts_norm)
+        finally:
+            semantic_adapter.train(was_training)
+    sim_matrix = compute_fused_sim_matrix(
+        desc_d,
+        map_p,
+        sem_mode=sem_mode,
+        desc_sem_d=desc_sem_d,
+        map_sem_p=map_sem_p,
+        rel_d=rel_d,
+        map_rel_p=map_rel_p,
+        lambda_sem=lambda_sem,
+    )  # (1, N, HW)
 
     # Reliable correspondences: top 50% confidence (peak of the softmax) and mutual nearest neighbors
     prob = F.softmax(sim_matrix / SOFT_ARGMAX_TEMPERATURE, dim=-1)
@@ -221,14 +435,60 @@ def estimate_correspondences(
     return src_px, dst_px
 
 
-def align_to_floorplan(recon: ReconstructionDict | dict[str, Any], plan_img: Image.Image, model: Any) -> AlignmentDict:
+def align_to_floorplan(
+    recon: ReconstructionDict | dict[str, Any],
+    plan_img: Image.Image,
+    model: Any,
+    *,
+    sem_mode: SemMode = "none",
+    semantic_adapter: SemanticAdapter | None = None,
+    photo_sem: SemanticMapInput | None = None,
+    plan_sem: SemanticMapInput | None = None,
+    lambda_sem: float = 0.5,
+    tau: float = 5.0,
+) -> AlignmentDict:
     """Density map of a reconstruction, its reliable correspondences and M (density map -> floorplan pixels)."""
-    proj_params, points, _ = reconstruct_projection_geometry(recon["points_cam0"], recon["conf"], recon["est_gravity_cam"])
+    if sem_mode not in ("none", "uniform", "consensus"):
+        raise ValueError(f"Unsupported sem_mode: {sem_mode!r}")
+    if lambda_sem < 0.0:
+        raise ValueError(f"lambda_sem must be non-negative, got {lambda_sem}")
+    if sem_mode != "none":
+        if (photo_sem is None) != (plan_sem is None):
+            raise ValueError("Both photo_sem and plan_sem must be provided together when sem_mode != 'none'")
+        if semantic_adapter is not None and (photo_sem is None or plan_sem is None):
+            raise ValueError("photo_sem and plan_sem are required when semantic_adapter is provided with sem_mode != 'none'")
+    proj_params, points, mask = reconstruct_projection_geometry(recon["points_cam0"], recon["conf"], recon["est_gravity_cam"])
     density_img = render_density_map(points, proj_params)
-    src_px, dst_px = estimate_correspondences(model, density_img, plan_img)
+    density_sem: SemanticMapInput | None = None
+    if sem_mode != "none" and photo_sem is not None and plan_sem is not None:
+        if semantic_adapter is None:
+            raise ValueError("semantic_adapter is required when sem_mode != 'none' and semantic maps are provided")
+        sem_idx_grid, photo_palette, conf_grid = photo_sem
+        den_sem_idx, den_sem_rel, den_palette, _ = project_posed_semantics(
+            points,
+            mask,
+            sem_idx_grid,
+            photo_palette,
+            proj_params,
+            conf_grid=conf_grid,
+            tau=tau,
+            training_rounding=False,
+        )
+        density_sem = (den_sem_idx, den_palette, den_sem_rel)
+
+    src_px, dst_px = estimate_correspondences(
+        model,
+        density_img,
+        plan_img,
+        sem_mode=sem_mode,
+        semantic_adapter=semantic_adapter,
+        density_sem=density_sem,
+        plan_sem=plan_sem,
+        lambda_sem=lambda_sem,
+    )
     M, _ = cv2.estimateAffinePartial2D(src_px, dst_px, method=cv2.RANSAC, ransacReprojThreshold=0.04 * EVAL_IMG_RES)
     if M is None:
-        raise ValueError("RANSAC failed to estimate the similarity transform.")
+        raise AlignmentFailureError("RANSAC failed to estimate the similarity transform.")
     return {"proj_params": proj_params, "density_img": density_img, "src_px": src_px, "dst_px": dst_px, "M": M}
 
 
