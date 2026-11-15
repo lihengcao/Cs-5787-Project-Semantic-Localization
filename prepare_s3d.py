@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import os
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -20,7 +21,13 @@ from scenealigner import structured3d as s3d
 from scenealigner.evaluation import process_gt_correspondences
 from scenealigner.inference import reconstruct_projection_geometry
 from scenealigner.preprocess import load_models, reconstruct
-from scenealigner.semantics import ClipTextEncoder, DEFAULT_CLIP_MODEL, save_semantic_map
+from scenealigner.semantics import (
+    DEFAULT_CLIP_MODEL,
+    ClipTextEncoder,
+    aggregate_topdown_semantics,
+    project_posed_semantics,
+    save_semantic_map,
+)
 from scenealigner.training import render_training_map
 
 if TYPE_CHECKING:
@@ -81,20 +88,99 @@ def pi3_sample(
     return render_training_map(points, proj_params), density_px, plan_px
 
 
+def project_depth_semantics(
+    world_points: NDArray[np.floating[Any]],
+    aligned_sem_idx: NDArray[np.integer[Any]],
+    view_palette: NDArray[np.floating[Any]],
+    view_labels: Sequence[str] | None = None,
+    size: int = 512,
+    padding: float = 0.1,
+    tau: float = 5.0,
+) -> tuple[NDArray[np.uint8], NDArray[np.float32], NDArray[np.float16], list[str]]:
+    """Project view semantics along Structured3D depth points using the exact depth_sample grid & filters."""
+    aligned_arr = np.asarray(aligned_sem_idx)
+    if aligned_arr.shape != world_points.shape[:2]:
+        raise ValueError(
+            f"aligned_sem_idx shape {aligned_arr.shape} must match world_points spatial shape {world_points.shape[:2]}"
+        )
+    empty_args = (
+        np.empty(0, dtype=np.int32),
+        np.empty(0, dtype=np.int32),
+        np.empty(0, dtype=np.int32),
+        view_palette,
+        size,
+    )
+    valid = ~np.isnan(world_points).any(axis=-1)
+    points = world_points[valid]
+    sem_pts = aligned_arr[valid]
+    if len(points) == 0:
+        return aggregate_topdown_semantics(*empty_args, tau=tau, labels=view_labels)
+
+    keep_z = (points[:, 2] >= np.percentile(points[:, 2], 20.0)) & (points[:, 2] <= np.percentile(points[:, 2], 95.0))
+    points, sem_pts = points[keep_z], sem_pts[keep_z]
+    if len(points) == 0:
+        return aggregate_topdown_semantics(*empty_args, tau=tau, labels=view_labels)
+
+    x, y = points[:, 0], points[:, 1]
+    keep_xy = (
+        (x >= np.percentile(x, 2.5)) & (x <= np.percentile(x, 97.5))
+        & (y >= np.percentile(y, 2.5)) & (y <= np.percentile(y, 97.5))
+    )
+    x, y, sem_pts = x[keep_xy], y[keep_xy], sem_pts[keep_xy]
+    if len(x) == 0:
+        return aggregate_topdown_semantics(*empty_args, tau=tau, labels=view_labels)
+
+    width, height = x.max() - x.min(), y.max() - y.min()
+    span = max(width, height)
+    if span <= 0:
+        return aggregate_topdown_semantics(*empty_args, tau=tau, labels=view_labels)
+    scale = (size * (1 - padding * 2)) / span
+    u = ((x - x.min()) * scale + (size - width * scale) / 2).astype(np.int32)
+    v = size - 1 - ((y - y.min()) * scale + (size - height * scale) / 2).astype(np.int32)
+    return aggregate_topdown_semantics(v, u, sem_pts, view_palette, size, tau=tau, labels=view_labels)
+
+
+def project_pi3_semantics(
+    recon: ReconstructionDict,
+    aligned_sem_idx: NDArray[np.integer[Any]],
+    view_palette: NDArray[np.floating[Any]],
+    view_labels: Sequence[str] | None = None,
+    tau: float = 5.0,
+) -> tuple[NDArray[np.uint8], NDArray[np.float32], NDArray[np.float16], list[str]]:
+    """Project view semantics along pi3 points matching render_training_map rounding."""
+    proj_params, points, mask = reconstruct_projection_geometry(recon["points_cam0"], recon["conf"], recon["est_gravity_cam"])
+    return project_posed_semantics(
+        points,
+        mask,
+        aligned_sem_idx,
+        view_palette,
+        proj_params,
+        tau=tau,
+        training_rounding=True,
+        labels=view_labels,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--s3d_root", required=True, help="Structured3D dataset: the directory of the scene_* folders")
     parser.add_argument("--output", required=True)
     parser.add_argument("--scenes", type=int, nargs=2, default=[s3d.TRAIN_SCENES.start, s3d.TRAIN_SCENES.stop], help="first train scene and the one after the last")
-    parser.add_argument("--no_semantics", action="store_true", help="skip open-vocabulary floorplan semantic generation")
+    parser.add_argument("--no_semantics", action="store_true", help="skip all semantic map generation (floorplan + photo)")
     parser.add_argument("--include_rooms", action="store_true", help="include room-type labels in floorplan semantics")
     parser.add_argument("--clip_model", default=DEFAULT_CLIP_MODEL, help="HuggingFace CLIP model ID for text palette encoding")
+    parser.add_argument("--photo_sem_source", choices=["gt", "none"], default="gt", help="2D photo semantic source")
+    parser.add_argument("--structural_photo_semantics", action="store_true", help="restrict photo GT semantics to wall/door/window")
     args = parser.parse_args()
+
+    export_floorplan_sem = not args.no_semantics
+    export_photo_sem = (not args.no_semantics) and (args.photo_sem_source != "none")
+    allowed_photo_labels = s3d.STRUCTURAL_PHOTO_LABELS if args.structural_photo_semantics else None
 
     recon_model, geocalib = load_models(recon_model="pi3-original")
     text_encoder = None if args.no_semantics else ClipTextEncoder(model_name=args.clip_model)
     os.makedirs(os.path.join(args.output, "floorplan"), exist_ok=True)
-    if not args.no_semantics:
+    if export_floorplan_sem:
         os.makedirs(os.path.join(args.output, "floorplan_sem"), exist_ok=True)
     pairs = []
     for scene in tqdm(range(*args.scenes)):
@@ -109,7 +195,7 @@ def main() -> None:
         plan_gray = np.array(plan_img.convert("L"))
 
         sem_prefix = None
-        if not args.no_semantics:
+        if export_floorplan_sem:
             sem_idx, palette, labels = s3d.load_semantic_floorplan(
                 scene_dir, text_encoder=text_encoder, include_rooms=args.include_rooms, plan_params=plan_params
             )
@@ -121,6 +207,13 @@ def main() -> None:
             plan_xy = s3d.world_to_plan(world_points, plan_params)
             recon = reconstruct([os.path.join(view_dir, "rgb_rawlight.png")], recon_model, geocalib)
             samples = {"depth": depth_sample(world_points, plan_xy, plan_gray), "pi3": pi3_sample(recon, plan_xy, plan_gray)}
+
+            view_sem_args: tuple[NDArray[np.uint8], NDArray[np.float16], list[str]] | None = None
+            if export_photo_sem and any(len(sample[1]) >= MIN_CORRESPONDENCES for sample in samples.values()):
+                view_sem_args = s3d.load_view_gt_semantics(
+                    view_dir, text_encoder=text_encoder, allowed_labels=allowed_photo_labels
+                )
+
             room_id, position_id = view_dir.split(os.sep)[-4], view_dir.split(os.sep)[-1]
             for source, sample in samples.items():
                 if len(sample[1]) < MIN_CORRESPONDENCES:
@@ -133,8 +226,21 @@ def main() -> None:
                 row = {"scene_id": scene_id, "density": f"{name}.png", "floorplan": plan_path, "correspondences": f"{name}.npy"}
                 if sem_prefix is not None:
                     row["floorplan_sem"] = sem_prefix
+                if view_sem_args is not None:
+                    v_idx, v_pal, v_lbls = view_sem_args
+                    if source == "depth":
+                        d_idx, d_rel, d_pal, d_lbls = project_depth_semantics(world_points, v_idx, v_pal, v_lbls)
+                    else:
+                        d_idx, d_rel, d_pal, d_lbls = project_pi3_semantics(recon, v_idx, v_pal, v_lbls)
+                    sem_name = os.path.join(f"{source}_sem", scene_id, f"{room_id}_{position_id}")
+                    save_semantic_map(os.path.join(args.output, sem_name), d_idx, d_pal, sem_rel=d_rel, labels=d_lbls)
+                    row["density_sem"] = sem_name
                 pairs.append(row)
-    columns = ["scene_id", "density", "floorplan", "correspondences"] + ([] if args.no_semantics else ["floorplan_sem"])
+    columns = (
+        ["scene_id", "density", "floorplan", "correspondences"]
+        + (["floorplan_sem"] if export_floorplan_sem else [])
+        + (["density_sem"] if export_photo_sem else [])
+    )
     pd.DataFrame(pairs, columns=columns).to_csv(os.path.join(args.output, f"scenes_{args.scenes[0]}_{args.scenes[1]}.csv"), index=False)
 
 

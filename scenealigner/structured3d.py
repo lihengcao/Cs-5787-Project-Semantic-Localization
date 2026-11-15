@@ -8,7 +8,7 @@ import argparse
 import io
 import json
 import os
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from typing import TYPE_CHECKING, Any, TypeAlias
 
 import cv2
@@ -20,11 +20,12 @@ from shapely.geometry import GeometryCollection, LineString, MultiLineString, Mu
 from shapely.ops import unary_union
 
 from .preprocess import resize_plan
-from .semantics import normalize_label
+from .semantics import align_mask_to_grid, normalize_label
 
 if TYPE_CHECKING:
     from shapely.geometry.base import BaseGeometry
 
+    from .preprocess import ReconMode
     from .semantics import ClipTextEncoder
 
 matplotlib.use("Agg")
@@ -464,6 +465,111 @@ def load_world_points(view_dir: str, size: int = 518) -> NDArray[np.float64]:
     points = np.stack([(u - cx) * depth / fx, (v - cy) * depth / fy, depth], axis=-1) @ R_world2cam + eye
     points[depth <= 0] = np.nan
     return points
+
+
+NYU40_LABELS: dict[int, str] = {
+    1: "wall",
+    2: "floor",
+    3: "cabinet",
+    4: "bed",
+    5: "chair",
+    6: "sofa",
+    7: "table",
+    8: "door",
+    9: "window",
+    10: "bookshelf",
+    11: "picture",
+    12: "counter",
+    13: "blinds",
+    14: "desk",
+    15: "shelves",
+    16: "curtain",
+    17: "dresser",
+    18: "pillow",
+    19: "mirror",
+    20: "floor mat",
+    21: "clothes",
+    22: "ceiling",
+    23: "books",
+    24: "refrigerator",
+    25: "television",
+    26: "paper",
+    27: "towel",
+    28: "shower curtain",
+    29: "box",
+    30: "whiteboard",
+    31: "person",
+    32: "nightstand",
+    33: "toilet",
+    34: "sink",
+    35: "lamp",
+    36: "bathtub",
+    37: "bag",
+}
+STRUCTURAL_PHOTO_LABELS: frozenset[str] = frozenset({"wall", "door", "window"})
+DEFAULT_EXCLUDED_PHOTO_LABELS: frozenset[str] = frozenset({"floor", "ceiling"})
+
+
+def _read_raw_label_png(sem_path: str) -> NDArray[np.integer[Any]]:
+    """Read raw NYUv2 class indices from a PNG without palette-to-RGB color expansion."""
+    with Image.open(sem_path) as img:
+        raw = np.asarray(img)
+    if raw.ndim == 3:
+        if raw.shape[2] >= 3 and np.array_equal(raw[..., 0], raw[..., 1]) and np.array_equal(raw[..., 0], raw[..., 2]):
+            raw = raw[..., 0]
+        else:
+            raise ValueError(f"Expected single-channel or equal-RGB label PNG at {sem_path}, got shape={raw.shape}")
+    if raw.ndim != 2 or not np.issubdtype(raw.dtype, np.integer):
+        raise ValueError(f"Expected 2D integer label PNG at {sem_path}, got shape={raw.shape} dtype={raw.dtype}")
+    return raw
+
+
+def load_view_gt_semantics(
+    view_dir: str,
+    text_encoder: ClipTextEncoder | None = None,
+    *,
+    allowed_labels: Collection[str] | None = None,
+    excluded_labels: Collection[str] = DEFAULT_EXCLUDED_PHOTO_LABELS,
+    target_size: int | None = 518,
+    mode: ReconMode = "pad",
+) -> tuple[NDArray[np.uint8], NDArray[np.float16], list[str]]:
+    """Load Structured3D view semantic.png (NYUv2 40 classes) into a compact CLIP palette and aligned index map."""
+    sem_path = os.path.join(view_dir, "semantic.png")
+    raw_ids = _read_raw_label_png(sem_path)
+    aligned_raw = align_mask_to_grid(raw_ids, target_size=target_size, mode=mode) if target_size is not None else raw_ids
+
+    allowed_set = (
+        None
+        if allowed_labels is None
+        else frozenset(clean for lbl in allowed_labels if (clean := normalize_label(lbl)))
+    )
+    excluded_set = frozenset(clean for lbl in excluded_labels if (clean := normalize_label(lbl)))
+
+    present_ids = sorted(int(cid) for cid in np.unique(aligned_raw) if int(cid) in NYU40_LABELS)
+    labels: list[str] = []
+    lut_size = max(NYU40_LABELS) + 1
+    lut = np.zeros(lut_size, dtype=np.uint8)
+    label_to_compact: dict[str, int] = {}
+    for cid in present_ids:
+        clean = normalize_label(NYU40_LABELS[cid])
+        if not clean or clean in excluded_set:
+            continue
+        if allowed_set is not None and clean not in allowed_set:
+            continue
+        if clean not in label_to_compact:
+            label_to_compact[clean] = len(labels) + 1
+            labels.append(clean)
+        lut[cid] = np.uint8(label_to_compact[clean])
+
+    in_range = (aligned_raw >= 0) & (aligned_raw < lut_size)
+    sem_idx = np.where(in_range, lut[np.clip(aligned_raw, 0, lut_size - 1)], np.uint8(0)).astype(np.uint8)
+
+    if text_encoder is None:
+        from .semantics import ClipTextEncoder
+
+        text_encoder = ClipTextEncoder()
+    palette = text_encoder.encode_palette(labels)
+    return sem_idx, palette, labels
 
 
 if __name__ == "__main__":
