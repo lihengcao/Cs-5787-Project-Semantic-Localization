@@ -20,6 +20,7 @@ from scenealigner import structured3d as s3d
 from scenealigner.evaluation import process_gt_correspondences
 from scenealigner.inference import reconstruct_projection_geometry
 from scenealigner.preprocess import load_models, reconstruct
+from scenealigner.semantics import ClipTextEncoder, DEFAULT_CLIP_MODEL, save_semantic_map
 from scenealigner.training import render_training_map
 
 if TYPE_CHECKING:
@@ -85,10 +86,16 @@ def main() -> None:
     parser.add_argument("--s3d_root", required=True, help="Structured3D dataset: the directory of the scene_* folders")
     parser.add_argument("--output", required=True)
     parser.add_argument("--scenes", type=int, nargs=2, default=[s3d.TRAIN_SCENES.start, s3d.TRAIN_SCENES.stop], help="first train scene and the one after the last")
+    parser.add_argument("--no_semantics", action="store_true", help="skip open-vocabulary floorplan semantic generation")
+    parser.add_argument("--include_rooms", action="store_true", help="include room-type labels in floorplan semantics")
+    parser.add_argument("--clip_model", default=DEFAULT_CLIP_MODEL, help="HuggingFace CLIP model ID for text palette encoding")
     args = parser.parse_args()
 
     recon_model, geocalib = load_models(recon_model="pi3-original")
+    text_encoder = None if args.no_semantics else ClipTextEncoder(model_name=args.clip_model)
     os.makedirs(os.path.join(args.output, "floorplan"), exist_ok=True)
+    if not args.no_semantics:
+        os.makedirs(os.path.join(args.output, "floorplan_sem"), exist_ok=True)
     pairs = []
     for scene in tqdm(range(*args.scenes)):
         scene_id = f"scene_{scene:05d}"
@@ -100,6 +107,14 @@ def main() -> None:
         plan_path = os.path.join("floorplan", f"{scene_id}.png")
         plan_img.save(os.path.join(args.output, plan_path))
         plan_gray = np.array(plan_img.convert("L"))
+
+        sem_prefix = None
+        if not args.no_semantics:
+            sem_idx, palette, labels = s3d.load_semantic_floorplan(
+                scene_dir, text_encoder=text_encoder, include_rooms=args.include_rooms, plan_params=plan_params
+            )
+            sem_prefix = os.path.join("floorplan_sem", scene_id)
+            save_semantic_map(os.path.join(args.output, sem_prefix), sem_idx, palette, labels=labels)
 
         for view_dir in s3d.list_views(scene_dir):
             world_points = s3d.load_world_points(view_dir)
@@ -115,8 +130,11 @@ def main() -> None:
                 os.makedirs(os.path.join(args.output, source, scene_id), exist_ok=True)
                 density_img.save(os.path.join(args.output, f"{name}.png"))
                 np.save(os.path.join(args.output, f"{name}.npy"), np.stack([plan_px, density_px]))
-                pairs.append({"scene_id": scene_id, "density": f"{name}.png", "floorplan": plan_path, "correspondences": f"{name}.npy"})
-    columns = ["scene_id", "density", "floorplan", "correspondences"]
+                row = {"scene_id": scene_id, "density": f"{name}.png", "floorplan": plan_path, "correspondences": f"{name}.npy"}
+                if sem_prefix is not None:
+                    row["floorplan_sem"] = sem_prefix
+                pairs.append(row)
+    columns = ["scene_id", "density", "floorplan", "correspondences"] + ([] if args.no_semantics else ["floorplan_sem"])
     pd.DataFrame(pairs, columns=columns).to_csv(os.path.join(args.output, f"scenes_{args.scenes[0]}_{args.scenes[1]}.csv"), index=False)
 
 
