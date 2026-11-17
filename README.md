@@ -2,7 +2,7 @@
 
 **CS 5787 Deep Learning (Fall 2026) final project.** Manaswita Kodali (mk2774), Liheng Cao (lc2332), Jiatong Xu (jx429)
 
-A fork of [SceneAligner](https://github.com/Cornell-VAILab/SceneAligner) ([paper](https://arxiv.org/abs/2605.22581), [project page](https://Cornell-VAILab.github.io/SceneAligner)) by Cho, Cai and Averbuch-Elor (NeurIPS'26). `main` holds the original code; the `liheng` branch adds **multi-view, open-vocabulary semantic consensus** to its floorplan localization.
+An extension of [SceneAligner](https://github.com/Cornell-VAILab/SceneAligner) ([paper](https://arxiv.org/abs/2605.22581), [project page](https://Cornell-VAILab.github.io/SceneAligner)) by Cho, Cai, and Averbuch-Elor (NeurIPS 2026). Building on the original implementation, we introduce open-vocabulary semantic representations, multi-view semantic consensus, and reliability-aware fusion with DINOv3 features to improve floorplan localization.
 
 ![teaser](./assets/teaser.png)
 > SceneAligner reconstructs a gravity-aligned 3D point cloud from photos and aligns it to a 2D floorplan, localizing the photos within it.
