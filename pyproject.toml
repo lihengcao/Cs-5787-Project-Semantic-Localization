@@ -1,0 +1,14 @@
+[tool.pyright]
+pythonVersion = "3.11"
+typeCheckingMode = "standard"
+venvPath = "."
+venv = ".venv"
+include = ["scenealigner", "runners", "*.py", "tests"]
+exclude = [".venv", "outputs", "data", "__pycache__"]
+reportMissingImports = "none"
+reportMissingModuleSource = "none"
+reportMissingTypeStubs = false
+reportPossiblyUnboundVariable = "none"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

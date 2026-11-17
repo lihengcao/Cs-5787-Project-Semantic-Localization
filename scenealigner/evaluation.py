@@ -1,21 +1,38 @@
 """Evaluation on C3 (Sec. 4.2): ground truth, correspondence accuracy (PCK, RMSE) and camera pose recall."""
+from __future__ import annotations
+
 import os
 from collections import defaultdict
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Any, TypedDict
 
 import cv2
 import numpy as np
+import pandas as pd
 import torch
+from numpy.typing import NDArray
 from PIL import Image
 
 from .inference import EVAL_IMG_RES, get_density_coordinates
-from .preprocess import get_resized_size
+from .preprocess import PlanTransformParams, ReconMode, get_resized_size
+
+if TYPE_CHECKING:
+    from .inference import PoseAlignment, ProjParams, ReconstructionDict
+
+
+class CorrespondencesDict(TypedDict):
+    tensor_coords: NDArray[np.float32]
+    plan_coords: NDArray[np.float32]
+
 
 ANGLE_THRESHOLDS = (5, 10, 20, 30)          # degrees
 POSITION_THRESHOLDS = (0.05, 0.1, 0.2)      # relative to the diagonal of the 512 x 512 floorplan
 PCK_THRESHOLDS = (0.01, 0.03, 0.05, 0.10, 0.15, 0.30)  # relative to the floorplan resolution
 
 
-def transform_correspondences(corrs, orientation, w, h):
+def transform_correspondences(
+    corrs: NDArray[np.floating[Any]], orientation: int, w: int, h: int
+) -> NDArray[np.floating[Any]]:
     """Pixel coordinates (N, 2) of a stored photo of size (w, h) -> coordinates after its EXIF orientation."""
     x, y = corrs[:, 0], corrs[:, 1]
     nx, ny = {1: (x, y), 2: (w - x, y), 3: (w - x, h - y), 4: (x, h - y),
@@ -23,7 +40,14 @@ def transform_correspondences(corrs, orientation, w, h):
     return np.stack([nx, ny], axis=1)
 
 
-def load_correspondences(corr_path, photo_path, plan_transform_params, mode="pad", photo_size=518, plan_size=EVAL_IMG_RES):
+def load_correspondences(
+    corr_path: Any,
+    photo_path: str,
+    plan_transform_params: PlanTransformParams,
+    mode: ReconMode = "pad",
+    photo_size: int = 518,
+    plan_size: int = EVAL_IMG_RES,
+) -> CorrespondencesDict | None:
     """Annotated correspondences of a photo (a C3 file): pixels in the preprocessed photo and in the resized
     floorplan, or None if there is none inside both."""
     p_scale, p_off_x, p_off_y = plan_transform_params
@@ -50,7 +74,9 @@ def load_correspondences(corr_path, photo_path, plan_transform_params, mode="pad
     return {"tensor_coords": tensor_coords[valid], "plan_coords": plan_coords[valid]} if valid.any() else None
 
 
-def load_ground_truth(c3_root, rows, plan_transform_params):
+def load_ground_truth(
+    c3_root: str, rows: pd.DataFrame, plan_transform_params: PlanTransformParams
+) -> tuple[list[CorrespondencesDict | None], list[tuple[NDArray[np.float64], NDArray[np.float64]]]]:
     """Ground truth of the photos of one reconstruction (rows of data/c3/test.csv, in order).
 
     Returns batch_corrs (per photo: its annotated correspondences, or None) and gt_poses (per photo:
@@ -58,8 +84,8 @@ def load_ground_truth(c3_root, rows, plan_transform_params):
     """
     batch_corrs, gt_poses = [], []
     for row in rows.itertuples():
-        file_name = os.path.join(str(row.uid // 1000), f"{row.uid:06d}.npy")
-        photo_path = os.path.join(c3_root, "visual", row.scene_name, row.photo_path)
+        file_name = os.path.join(str(row.uid // 1000), f"{row.uid:06d}.npy")  # type: ignore[operator]
+        photo_path = os.path.join(c3_root, "visual", row.scene_name, row.photo_path)  # type: ignore[arg-type]
         corr_path = os.path.join(c3_root, "geometric", "test", "correspondences", file_name)
         batch_corrs.append(load_correspondences(corr_path, photo_path, plan_transform_params))
         R_p2c, t_p, _ = np.load(os.path.join(c3_root, "geometric", "test", "camera_poses", file_name), allow_pickle=True)
@@ -67,7 +93,13 @@ def load_ground_truth(c3_root, rows, plan_transform_params):
     return batch_corrs, gt_poses
 
 
-def process_gt_correspondences(corr_data, s_idx, points_cam0, proj_params, mask=None):
+def process_gt_correspondences(
+    corr_data: CorrespondencesDict,
+    s_idx: int,
+    points_cam0: NDArray[np.floating[Any]],
+    proj_params: ProjParams,
+    mask: NDArray[np.bool_] | None = None,
+) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
     """Maps the annotated pixels of photo s_idx to the density map through their 3D points.
 
     mask (S, H, W): if given, only the pixels of the points of the density map are used (training data).
@@ -85,19 +117,30 @@ def process_gt_correspondences(corr_data, s_idx, points_cam0, proj_params, mask=
     return density_map_px, pc_gt[valid]
 
 
-def get_camera_center_on_density_px(extrinsics, proj_params):
+def get_camera_center_on_density_px(
+    extrinsics: NDArray[np.floating[Any]], proj_params: ProjParams
+) -> NDArray[np.float32]:
     """Camera centers (S, 2) on the density map."""
     return get_density_coordinates(extrinsics[:, :3, 3] @ proj_params["R_rect"].T, proj_params)
 
 
-def get_gt_camera_center_on_plan_px(R_gt, t_gt, plan_transform_params):
+def get_gt_camera_center_on_plan_px(
+    R_gt: NDArray[np.floating[Any]], t_gt: NDArray[np.floating[Any]], plan_transform_params: PlanTransformParams
+) -> NDArray[np.floating[Any]]:
     """Ground-truth camera center on the resized floorplan."""
     scale, off_x, off_z = plan_transform_params
     cc = -R_gt.T @ t_gt  # camera center in the floorplan frame
     return np.array([cc[0] * scale + off_x, cc[2] * scale + off_z])
 
 
-def compute_pose_error_analytic(M_pred, extrinsic_i, proj_params, pred_cam_center_den_px, gt_cam_center_plan_px, forward_gt_plan):
+def compute_pose_error_analytic(
+    M_pred: NDArray[np.floating[Any]],
+    extrinsic_i: NDArray[np.floating[Any]],
+    proj_params: ProjParams,
+    pred_cam_center_den_px: NDArray[np.floating[Any]],
+    gt_cam_center_plan_px: NDArray[np.floating[Any]],
+    forward_gt_plan: NDArray[np.floating[Any]],
+) -> tuple[np.floating[Any], float]:
     """Positional error (floorplan pixels) and angular error (degrees) of one camera on the floorplan.
 
     forward_gt_plan: ground-truth viewing direction on the floorplan (2,).
@@ -116,7 +159,13 @@ def compute_pose_error_analytic(M_pred, extrinsic_i, proj_params, pred_cam_cente
     return t_error_px, r_error_deg
 
 
-def evaluate_alignment(recon, alignment, batch_corrs, gt_poses, plan_transform_params):
+def evaluate_alignment(
+    recon: ReconstructionDict | dict[str, Any],
+    alignment: PoseAlignment,
+    batch_corrs: Sequence[CorrespondencesDict | None],
+    gt_poses: Sequence[tuple[NDArray[np.floating[Any]], NDArray[np.floating[Any]]]],
+    plan_transform_params: PlanTransformParams,
+) -> tuple[NDArray[np.floating[Any]], NDArray[np.floating[Any]], list[float], list[float]]:
     """Errors of one reconstruction: predicted and ground-truth floorplan coordinates of the annotated pixels
     (normalized by the floorplan resolution), and the positional (relative to the floorplan diagonal) and angular
     errors of the cameras."""
@@ -141,7 +190,7 @@ def evaluate_alignment(recon, alignment, batch_corrs, gt_poses, plan_transform_p
     return np.concatenate(pred_coords), np.concatenate(gt_coords), t_errs, r_errs
 
 
-def compute_metrics(scene_results):
+def compute_metrics(scene_results: dict[str, dict[str, list[Any]]]) -> dict[str, float]:
     """Tables 1 and 2: metrics of each scene averaged over the scenes (recalls and PCK in %)."""
     metrics = defaultdict(list)
     for r in scene_results.values():

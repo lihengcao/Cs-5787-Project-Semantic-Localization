@@ -3,19 +3,37 @@
 pi3 reconstructs the photos in the frame of the first camera. GeoCalib predicts a gravity direction per photo, and
 the spherical medoid of these directions gives the gravity direction of the scene.
 """
+from __future__ import annotations
+
 import math
 import random
+from collections.abc import Sequence
+from typing import Any, Literal, TypeAlias, TypedDict
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from geocalib import GeoCalib
 from huggingface_hub import hf_hub_download
+from numpy.typing import NDArray
 from pi3.models.pi3 import Pi3
 from pi3.utils.geometry import homogenize_points, se3_inverse
 from PIL import Image
 from PIL.ImageOps import exif_transpose
 from torchvision import transforms as TF
+
+PlanTransformParams: TypeAlias = tuple[float, int, int]
+ReconMode: TypeAlias = Literal["pad", "crop"]
+
+
+class ReconstructionDict(TypedDict):
+    points_cam0: NDArray[np.floating[Any]]
+    conf: NDArray[np.floating[Any]]
+    extrinsics: NDArray[np.floating[Any]]
+    est_gravity_cam: NDArray[np.floating[Any]]
+    preprocessed_images: NDArray[np.uint8]
+    image_sizes: NDArray[np.integer[Any]]
+
 
 CHECKPOINTS = {"pi3": "ckpts/pi3-FT_weight.pt", "vggt": "ckpts/vggt-FT_weight.pt"}  # fine-tuned by MegaDepth-X
 MEGADEPTH_X_REVISION = "1c7dd2819846a4a51c10defae4f8c3f907af2b6e"
@@ -24,7 +42,7 @@ MAX_LIMIT = 150  # maximum number of photos per 3D reconstruction
 GEOCALIB_SEED = 1  # GeoCalib is randomized: seeded per reconstruction
 
 
-def load_models(checkpoint=None, recon_model="pi3"):
+def load_models(checkpoint: str | None = None, recon_model: str = "pi3") -> tuple[Any, Any]:
     """pi3 (fine-tuned on Internet photos by MegaDepth-X) and GeoCalib.
 
     recon_model: "pi3", "vggt" (training data of C3 only) or "pi3-original" (original pi3 weights, for Structured3D).
@@ -34,7 +52,7 @@ def load_models(checkpoint=None, recon_model="pi3"):
     else:
         if checkpoint is None:
             checkpoint = hf_hub_download("y-u-a-n-l-i/MegaDepth-X", CHECKPOINTS[recon_model], repo_type="dataset", revision=MEGADEPTH_X_REVISION)
-        state_dict = torch.load(checkpoint, map_location="cpu", weights_only=True)
+        state_dict = torch.load(checkpoint, map_location="cpu", weights_only=True)  # type: ignore[arg-type]
         if recon_model == "vggt":
             from vggt.models.vggt import VGGT  # optional dependency
             model = VGGT(enable_track=False)
@@ -44,7 +62,7 @@ def load_models(checkpoint=None, recon_model="pi3"):
     return model.eval().to("cuda"), GeoCalib(weights="pinhole").to("cuda")
 
 
-def resize_plan(pil_plan, plan_size=512):
+def resize_plan(pil_plan: Image.Image, plan_size: int = 512) -> tuple[Image.Image, PlanTransformParams]:
     """Resizes a floorplan to fit plan_size x plan_size and centers it on white.
 
     Returns the image and (scale, off_x, off_y), which map the original pixels to the resized ones.
@@ -57,23 +75,25 @@ def resize_plan(pil_plan, plan_size=512):
     return final_plan_img, (scale, off_x, off_y)
 
 
-def load_and_resize_plan(plan_path, plan_size=512):
+def load_and_resize_plan(plan_path: str, plan_size: int = 512) -> tuple[Image.Image, PlanTransformParams]:
     """Loads a floorplan and resizes it (resize_plan). The EXIF orientation is not applied, as in the C3
     annotations of floorplans."""
     pil_plan = Image.open(plan_path)
     if str(plan_path).lower().endswith(".gif"):
-        pil_plan.seek(pil_plan.n_frames // 2)
+        pil_plan.seek(pil_plan.n_frames // 2)  # type: ignore[attr-defined]
     return resize_plan(pil_plan.convert("RGB"), plan_size)
 
 
-def get_resized_size(width, height, target_size=518, mode="pad"):
+def get_resized_size(width: int, height: int, target_size: int = 518, mode: ReconMode = "pad") -> tuple[int, int]:
     """Photo size after resizing: the longer side (pad) or the width (crop) is 518 px, the other one a multiple of 14."""
     if width >= height or mode == "crop":
         return target_size, round(height * (target_size / width) / 14) * 14
     return round(width * (target_size / height) / 14) * 14, target_size
 
 
-def load_and_preprocess_images(image_paths, target_size=518, mode="pad"):
+def load_and_preprocess_images(
+    image_paths: Sequence[str], target_size: int = 518, mode: ReconMode = "pad"
+) -> tuple[torch.Tensor, NDArray[np.integer[Any]]]:
     """Loads photos (EXIF orientation applied), resizes them and pads them with white to 518 x 518.
 
     In crop mode (training data only), the width is resized to 518 and a taller photo is cropped at its center.
@@ -81,12 +101,13 @@ def load_and_preprocess_images(image_paths, target_size=518, mode="pad"):
     """
     images, image_sizes = [], []
     for image_path in image_paths:
+        img: Any
         with Image.open(image_path) as img:
             img = exif_transpose(img)
         if img.mode == "RGBA":  # transparent pixels become white
             img = Image.alpha_composite(Image.new("RGBA", img.size, (255, 255, 255, 255)), img)
         img = img.convert("RGB")
-        width, height = get_resized_size(*img.size, target_size, mode)
+        width, height = get_resized_size(*img.size, target_size, mode)  # type: ignore[call-arg]
         img = TF.ToTensor()(img.resize((width, height), Image.Resampling.BICUBIC))
         if height > target_size:
             top = (height - target_size) // 2
@@ -97,7 +118,7 @@ def load_and_preprocess_images(image_paths, target_size=518, mode="pad"):
     return torch.stack(images), np.array(image_sizes)
 
 
-def split_into_chunks(image_paths, max_limit=MAX_LIMIT):
+def split_into_chunks(image_paths: Sequence[str], max_limit: int = MAX_LIMIT) -> list[list[str]]:
     """Collections of more than 150 photos are shuffled and split into ceil(N / 150) chunks of nearly equal size."""
     image_paths = list(image_paths)
     num_chunks = math.ceil(len(image_paths) / max_limit)
@@ -107,7 +128,7 @@ def split_into_chunks(image_paths, max_limit=MAX_LIMIT):
     return [image_paths[i:i + chunk_size] for i in range(0, len(image_paths), chunk_size)]
 
 
-def compute_robust_gravity_medoid(vectors):
+def compute_robust_gravity_medoid(vectors: NDArray[np.floating[Any]]) -> NDArray[np.floating[Any]]:
     """Spherical medoid: the unit vector minimizing the sum of angles to all the others (robust to outliers)."""
     vectors = vectors / (np.linalg.norm(vectors, axis=1, keepdims=True) + 1e-8)
     angles = np.arccos(np.clip(vectors @ vectors.T, -1.0, 1.0))
@@ -115,7 +136,7 @@ def compute_robust_gravity_medoid(vectors):
 
 
 @torch.no_grad()
-def estimate_gravity(image_path, geocalib):
+def estimate_gravity(image_path: str, geocalib: Any) -> NDArray[np.floating[Any]]:
     """Gravity direction of a photo in its camera frame (OpenCV convention): minus the up direction of GeoCalib."""
     with Image.open(image_path) as img:
         geo_img = TF.ToTensor()(exif_transpose(img).convert("RGB")).to(next(geocalib.parameters()).device)
@@ -123,7 +144,13 @@ def estimate_gravity(image_path, geocalib):
 
 
 @torch.no_grad()
-def reconstruct(image_paths, model, geocalib, mode="pad", gravities=None):
+def reconstruct(
+    image_paths: Sequence[str],
+    model: Any,
+    geocalib: Any,
+    mode: ReconMode = "pad",
+    gravities: Sequence[NDArray[np.floating[Any]]] | None = None,
+) -> ReconstructionDict:
     """Reconstructs photos in the frame of the first camera and estimates the gravity direction in this frame.
 
     gravities: gravity direction of each photo (estimate_gravity), if already computed.
